@@ -359,6 +359,10 @@ export const availableComponents = [
     owner: 'patternfly',
   },
   {
+    name: '.github',
+    owner: 'patternfly'
+  },
+  {
     name: 'github-jira-sync',
     owner: 'rh-uxd'
   },
