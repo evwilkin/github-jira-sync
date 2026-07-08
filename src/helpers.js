@@ -391,6 +391,7 @@ export const buildJiraIssueData = (githubIssue, isUpdateIssue = false) => {
     assignees,
     issueType,
     author,
+    closedByPullRequestsReferences,
   } = githubIssue;
 
   // Extract repository name from the repository object
@@ -454,6 +455,13 @@ export const buildJiraIssueData = (githubIssue, isUpdateIssue = false) => {
     if (jiraIssueType.jiraName === 'Epic') {
       jiraIssue.fields['customfield_10011'] = title;
     }
+  }
+
+  const prUrls = closedByPullRequestsReferences?.nodes
+    ?.map((pr) => pr.url)
+    .filter(Boolean) || [];
+  if (prUrls.length > 0) {
+    jiraIssue.fields['customfield_10875'] = buildPrUrlsADF(prUrls);
   }
 
   return jiraIssue;
@@ -585,6 +593,11 @@ export const GET_ALL_REPO_ISSUES = `
           parent {
             url
           }
+          closedByPullRequestsReferences(first: 5) {
+            nodes {
+              url
+            }
+          }
           subIssues(first: $numSubIssuesPerIssue) {
             nodes {
               title
@@ -619,6 +632,11 @@ export const GET_ALL_REPO_ISSUES = `
                   url
                 }
                 totalCount
+              }
+              closedByPullRequestsReferences(first: 5) {
+                nodes {
+                  url
+                }
               }
             }
             pageInfo {
@@ -687,6 +705,11 @@ export const GET_ISSUE_DETAILS = `
         parent {
           url
         }
+        closedByPullRequestsReferences(first: 5) {
+          nodes {
+            url
+          }
+        }
         subIssues(first: 50) {
           nodes {
             state
@@ -721,6 +744,11 @@ export const GET_ISSUE_DETAILS = `
               }
               totalCount
             }
+            closedByPullRequestsReferences(first: 5) {
+              nodes {
+                url
+              }
+            }
           }
           totalCount
         }
@@ -754,6 +782,11 @@ const FETCH_SUB_ISSUES = `
                 url
               }
               totalCount
+            }
+            closedByPullRequestsReferences(first: 5) {
+              nodes {
+                url
+              }
             }
           }
           pageInfo { endCursor hasNextPage }
@@ -1484,6 +1517,19 @@ function buildCommentADF(comment, { truncated = false } = {}) {
       },
     ],
   };
+}
+
+// Build ADF for the Git Pull Request textarea field (customfield_10875)
+// URLs separated by hardBreaks within a single paragraph
+export function buildPrUrlsADF(urls) {
+  const content = [];
+  urls.forEach((url, i) => {
+    content.push({ type: 'text', text: String(url) });
+    if (i < urls.length - 1) {
+      content.push({ type: 'hardBreak' });
+    }
+  });
+  return { type: 'doc', version: 1, content: [{ type: 'paragraph', content }] };
 }
 
 // Build the metadata footer paragraph as ADF nodes

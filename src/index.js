@@ -89,7 +89,7 @@ const fetchJiraIssues = async (owner, repo, since) => {
   const jiraDate = new Date(since).toISOString().replace('T', ' ').substring(0, 16);
   const jiraIssues = await paginatedJiraSearch(
     `project = PF AND component = "${repo}" AND status not in (Closed, Resolved) AND updatedDate >= "${jiraDate}" ORDER BY key ASC`,
-    'key,id,description,status,resolution,assignee,issuetype,updated,summary,components,reporter'
+    'key,id,description,status,resolution,assignee,issuetype,updated,summary,components,reporter,customfield_10875'
   );
   console.log(`    --> Found ${jiraIssues.length} open Jira issues updated since ${since} for Jira component ${ repo }`);
   return jiraIssues;
