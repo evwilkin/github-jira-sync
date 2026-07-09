@@ -10,6 +10,7 @@ import {
   checkAndHandleArchivedJiraIssue,
   syncUpdatedJiraIssuesToGitHub,
 } from './syncJiraToGitHub.js';
+import { syncPRLinksToJira } from './syncPRLinksToJira.js';
 import { errorCollector, syncStats } from './logging.js';
 
 export let jiraIssues = [];
@@ -197,6 +198,12 @@ async function syncIssues(owner, repo, since, direction = 'both') {
       // if (unprocessedJiraIssues.length > 0) {
         // await handleUnprocessedJiraIssues(unprocessedJiraIssues, repo);
       // }
+    }
+
+    // Sync PR links for issues not updated recently (PRs don't bump issue.updatedAt)
+    if (direction === 'github-to-jira' || direction === 'both') {
+      console.log(`\n= GitHub → Jira sync: PR links from recently-updated PRs =\n`);
+      await syncPRLinksToJira(owner, repo, since);
     }
 
     // Jira → GitHub sync

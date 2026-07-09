@@ -797,6 +797,80 @@ const FETCH_SUB_ISSUES = `
   }
 `;
 
+// Fetch recently-updated PRs and the issues they close (for PR link sync)
+const GET_RECENT_PRS = `
+  query GetRecentPRs($owner: String!, $repo: String!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequests(
+        first: 50
+        after: $cursor
+        orderBy: {field: UPDATED_AT, direction: DESC}
+        states: [OPEN, MERGED]
+      ) {
+        nodes {
+          url
+          updatedAt
+          closingIssuesReferences(first: 10) {
+            nodes {
+              url
+            }
+          }
+        }
+        pageInfo { endCursor hasNextPage }
+      }
+    }
+  }
+`;
+
+// Lightweight query to get all PR links for a specific issue
+const GET_ISSUE_PR_LINKS = `
+  query GetIssuePRLinks($owner: String!, $repo: String!, $issueNumber: Int!) {
+    repository(owner: $owner, name: $repo) {
+      issue(number: $issueNumber) {
+        closedByPullRequestsReferences(first: 10) {
+          nodes { url }
+        }
+      }
+    }
+  }
+`;
+
+// Returns unique GitHub issue URLs from PRs updated since `since` for a repo
+export async function getRepoPRsSince(owner, repo, since) {
+  const sinceDate = new Date(since);
+  const issueUrls = new Set();
+  let cursor = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const response = await executeGraphQLQuery(GET_RECENT_PRS, { owner, repo, cursor }, owner);
+    const prs = response?.repository?.pullRequests;
+    if (!prs) break;
+
+    let hitOldPR = false;
+    for (const pr of prs.nodes) {
+      if (new Date(pr.updatedAt) < sinceDate) {
+        hitOldPR = true;
+        break;
+      }
+      for (const issue of pr.closingIssuesReferences.nodes) {
+        issueUrls.add(issue.url);
+      }
+    }
+
+    hasNextPage = !hitOldPR && prs.pageInfo.hasNextPage;
+    cursor = prs.pageInfo.endCursor;
+  }
+
+  return [...issueUrls];
+}
+
+// Returns all PR URLs that close a specific GitHub issue
+export async function getIssuePRLinks(owner, repo, issueNumber) {
+  const response = await executeGraphQLQuery(GET_ISSUE_PR_LINKS, { owner, repo, issueNumber }, owner);
+  return response?.repository?.issue?.closedByPullRequestsReferences?.nodes?.map((pr) => pr.url) || [];
+}
+
 // Fetch remaining sub-issues for issues where the initial bulk query was truncated
 async function fetchRemainingSubIssues(issue, owner, repo) {
   const { subIssues } = issue;
@@ -942,6 +1016,7 @@ export function extractTextFromADF(adf) {
   if (!adf) return '';
   if (typeof adf === 'string') return adf;
   if (adf.type === 'hardBreak') return '\n';
+  if (adf.type === 'inlineCard') return adf.attrs?.url || '';
   if (adf.type === 'text') return adf.text || '';
   if (adf.content) {
     return adf.content.map(extractTextFromADF).join('');
@@ -1524,7 +1599,7 @@ function buildCommentADF(comment, { truncated = false } = {}) {
 export function buildPrUrlsADF(urls) {
   const content = [];
   urls.forEach((url, i) => {
-    content.push({ type: 'text', text: String(url) });
+    content.push({ type: 'inlineCard', attrs: { url: String(url) } });
     if (i < urls.length - 1) {
       content.push({ type: 'hardBreak' });
     }
