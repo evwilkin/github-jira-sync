@@ -11,7 +11,6 @@ import {
   jiraClient,
   editJiraIssue,
   availableComponents,
-  getJiraProject,
   shouldSyncFromJira,
   extractJiraKeyFromText,
   fetchJiraIssueByKey,
@@ -579,7 +578,7 @@ export async function closeGitHubIssuesForClosedJira(closedJiraIssues) {
         await shortDelay();
         const openCheck = await jiraClient.get('/rest/api/3/search/jql', {
           params: {
-            jql: `project = ${getJiraProject(repo)} AND status not in (Closed, Resolved) AND description ~ "\\"Upstream URL: ${githubUrl}\\""`,
+            jql: `project = FELT AND status not in (Closed, Resolved) AND description ~ "\\"Upstream URL: ${githubUrl}\\""`,
             maxResults: 1,
             fields: 'key',
           },

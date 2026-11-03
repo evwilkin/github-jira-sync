@@ -495,31 +495,6 @@ export const getJiraComponent = (repoName) =>
     ? repoName
     : null;
 
-// Default Jira project for repos that don't specify one in availableComponents.
-export const DEFAULT_JIRA_PROJECT = 'FELT';
-
-/**
- * Resolve the Jira project key for a given GitHub repo name.
- * All repos sync to the default project (FELT). A repo may still override this
- * via an optional `jiraProject` field in availableComponents; unknown repos and
- * repos without an override fall back to the default project.
- * @param {string} repoName - GitHub repository name
- * @returns {string} Jira project key (e.g. 'FELT')
- */
-export const getJiraProject = (repoName) => {
-  const component = availableComponents.find((c) => c.name === repoName);
-  return component?.jiraProject || DEFAULT_JIRA_PROJECT;
-};
-
-// Jira projects whose screens expose the Git Pull Request field (customfield_10875).
-// PR links are written to that field only for these projects. A project missing the
-// field (e.g. FELT, where it isn't on the screens) would return a 400 that fails the
-// whole create/edit, so the sync skips the field there. Add a project key here once an
-// admin wires the Git PR field onto its screens.
-const PR_FIELD_PROJECTS = new Set(['PF']);
-export const jiraProjectHasPrField = (projectKey) =>
-  PR_FIELD_PROJECTS.has(projectKey);
-
 export const buildJiraIssueData = (githubIssue, isUpdateIssue = false) => {
   const {
     title,
@@ -588,7 +563,7 @@ export const buildJiraIssueData = (githubIssue, isUpdateIssue = false) => {
   // Add required extra fields for new issue creation
   if (!isUpdateIssue) {
     jiraIssue.fields.project = {
-      key: getJiraProject(url.split('/')[4]),
+      key: 'FELT',
     };
     // Epic name field is required on Epic creation
     if (jiraIssueType.jiraName === 'Epic') {
@@ -599,7 +574,9 @@ export const buildJiraIssueData = (githubIssue, isUpdateIssue = false) => {
   const prUrls = closedByPullRequestsReferences?.nodes
     ?.map((pr) => pr.url)
     .filter(Boolean) || [];
-  if (prUrls.length > 0 && jiraProjectHasPrField(getJiraProject(url.split('/')[4]))) {
+  // The Git Pull Request field is on FELT's edit screen but not its create screen, so
+  // setting it on create would be rejected. New issues pick it up on their next update.
+  if (isUpdateIssue && prUrls.length > 0) {
     jiraIssue.fields['customfield_10875'] = buildPrUrlsADF(prUrls);
   }
 

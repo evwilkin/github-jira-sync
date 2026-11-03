@@ -1,7 +1,5 @@
 import {
   buildJiraIssueData,
-  getJiraProject,
-  jiraProjectHasPrField,
   jiraClient,
   editJiraIssue,
   delay,
@@ -274,23 +272,13 @@ export async function updateJiraIssue(jiraIssue, githubIssue) {
       const hadGitHubAssignee = githubIssue.assignees?.nodes?.length > 0;
       const assigneeChanged = !hadAssignee && hadGitHubAssignee;
 
-      // Only compare/write the Git PR field on projects whose screens expose it.
-      // On projects without it (e.g. FELT) writing customfield_10875 would 400.
-      const prFieldSupported = jiraProjectHasPrField(
-        getJiraProject(githubIssue.url.split('/')[4])
-      );
-      let prLinksChanged = false;
-      if (prFieldSupported) {
-        const newPrUrls = githubIssue.closedByPullRequestsReferences?.nodes
-          ?.map((pr) => pr.url)
-          .filter(Boolean) || [];
-        const currentPrField = extractTextFromADF(jiraIssue.fields.customfield_10875).trim();
-        const newPrField = newPrUrls.join('\n');
-        prLinksChanged = currentPrField !== newPrField;
-        if (!prLinksChanged) {
-          delete jiraIssueData.fields['customfield_10875'];
-        }
-      } else {
+      const newPrUrls = githubIssue.closedByPullRequestsReferences?.nodes
+        ?.map((pr) => pr.url)
+        .filter(Boolean) || [];
+      const currentPrField = extractTextFromADF(jiraIssue.fields.customfield_10875).trim();
+      const newPrField = newPrUrls.join('\n');
+      const prLinksChanged = currentPrField !== newPrField;
+      if (!prLinksChanged) {
         delete jiraIssueData.fields['customfield_10875'];
       }
 
