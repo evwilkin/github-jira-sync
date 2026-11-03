@@ -29,6 +29,9 @@ export function getOctokitForOwner(owner) {
   let token;
   if (owner === 'rh-uxd') {
     token = process.env.GH_JIRA_SYNC_RHUXD_PAT;
+  } else if (owner === 'RedHat-UX') {
+    // RHDS org (Red Hat Design System) — uses the patternfly-jira-sync bot PAT
+    token = process.env.GH_JIRA_SYNC_RHDS_PAT;
   } else {
     // Default to patternfly token for 'patternfly' and any other owners
     token = process.env.GH_TOKEN;
@@ -236,7 +239,12 @@ const platformTeamUsers = {
   thatblindgeye: '712020:6f63713c-d61e-49de-8f52-be48015241ed',
   kmcfaul: '712020:b46e5c4b-c4b6-4c9c-a998-7811631e4f81',
   srambach: '557058:a502f956-47d6-4de9-85b0-75424d4014d0',
-  jcmill: '712020:e2a5129a-49ac-4813-a336-de270f523ba5'
+  jcmill: '712020:e2a5129a-49ac-4813-a336-de270f523ba5',
+  markcaron: '60fee5a5b704b400688af3ca',
+  adamjohnson: '712020:29e795ed-4a67-49fc-811b-dd910cc4aa08',
+  ArathyKumar: '712020:c852bf92-e852-4caa-b7e3-288e9f09894b',
+  bennypowers: '615ac3dd78e5e4007057c258',
+  zeroedin: '619d55dfc510bc006b8b0f89'
 };
 
 const enablementTeamUsers = {
@@ -259,6 +267,8 @@ const designTeamUsers = {
   kaylachumley: '712020:826e077b-27bf-4cec-abbd-33404f07359c',
   edonehoo: '628677200dae78006808ea80',
   'bekah-stephens': '5defd0548998970e5b43364a',
+  marionnegp: '61ddc3b0a54af90069d0760c',
+  coreyvickery: '5cc0bd9496f23e0e77176ac5'
 };
 
 const userMappings = {
@@ -310,9 +320,11 @@ const issueTypeMappings = {
     jiraName: 'Task',
     id: '10014',
   },
+  // FELT has no Feature type; GitHub Initiatives are skipped before creation
+  // (see index.js), but map to a valid FELT type defensively for any child path.
   Initiative: {
-    jiraName: 'Feature',
-    id: '10142',
+    jiraName: 'Story',
+    id: '10009',
   },
   SubTask: {
     jiraName: 'Sub-task',
@@ -374,6 +386,10 @@ export const availableComponents = [
   },
   {
     name: 'patternfly-doc-core',
+    owner: 'patternfly',
+  },
+  {
+    name: 'patternfly-elements',
     owner: 'patternfly',
   },
   {
@@ -459,6 +475,18 @@ export const availableComponents = [
   {
     name: 'patternfly-analytics',
     owner: 'rh-uxd'
+  },
+  {
+    name: 'red-hat-design-system',
+    owner: 'RedHat-UX'
+  },
+  {
+    name: 'red-hat-design-tokens',
+    owner: 'RedHat-UX'
+  },
+  {
+    name: 'red-hat-icons',
+    owner: 'RedHat-UX'
   }
 ];
 
@@ -535,7 +563,7 @@ export const buildJiraIssueData = (githubIssue, isUpdateIssue = false) => {
   // Add required extra fields for new issue creation
   if (!isUpdateIssue) {
     jiraIssue.fields.project = {
-      key: 'PF',
+      key: 'FELT',
     };
     // Epic name field is required on Epic creation
     if (jiraIssueType.jiraName === 'Epic') {
@@ -546,7 +574,9 @@ export const buildJiraIssueData = (githubIssue, isUpdateIssue = false) => {
   const prUrls = closedByPullRequestsReferences?.nodes
     ?.map((pr) => pr.url)
     .filter(Boolean) || [];
-  if (prUrls.length > 0) {
+  // The Git Pull Request field is on FELT's edit screen but not its create screen, so
+  // setting it on create would be rejected. New issues pick it up on their next update.
+  if (isUpdateIssue && prUrls.length > 0) {
     jiraIssue.fields['customfield_10875'] = buildPrUrlsADF(prUrls);
   }
 
@@ -1732,13 +1762,14 @@ export function appendMetadataToADF(existingADF, { number, url, reporter, assign
   };
 }
 
-// Extract Jira key (PF-XXXX format) from text
+// Extract a Jira key (e.g. FELT-1234) from text. Matches current (FELT) and legacy
+// (PF) project prefixes — issues moved into FELT keep their old PF key as a redirect,
+// and already-synced GitHub bodies still show the pre-move key.
 export function extractJiraKeyFromText(text) {
   if (!text || typeof text !== 'string') {
     return null;
   }
-  // Match PF- followed by one or more digits
-  const match = text.match(/PF-\d+/);
+  const match = text.match(/(?:FELT|PF)-\d+/);
   return match ? match[0] : null;
 }
 

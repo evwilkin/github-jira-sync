@@ -13,7 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Import exported functions directly
 import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGitHub.js';
-import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER } from '../src/helpers.js';
+import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER } from '../src/helpers.js';
 import { syncStats, errorCollector, markRunFailedIfErrors } from '../src/logging.js';
 
 let passed = 0;
@@ -564,7 +564,7 @@ console.log('\n=== Paginated Jira search ===');
   assert(helpersSrc.includes('data.total'), 'paginatedJiraSearch checks total for loop termination');
 
   // Verify all three fetch functions in index.js use paginatedJiraSearch
-  assert(indexSrc.includes("import { jiraClient, getRepoIssues, availableComponents, hasUpstreamUrl, paginatedJiraSearch }"),
+  assert(indexSrc.includes('paginatedJiraSearch') && /import \{[^}]*paginatedJiraSearch[^}]*\} from '\.\/helpers\.js'/.test(indexSrc),
     'index.js imports paginatedJiraSearch');
 
   // Count occurrences of paginatedJiraSearch calls (should be 3: open, closed, manual)
@@ -619,7 +619,7 @@ console.log('\n=== Old Jira issues without Upstream URL get GitHub issues create
   assert(indexSrc.includes('allManualJiraIssues'),
     'index.js combines manual and upstream-less issues');
 
-  const fetchJiraMatch = indexSrc.match(/paginatedJiraSearch\(\s*`project = PF AND component.*?status not in.*?`,\s*'([^']*)'/s);
+  const fetchJiraMatch = indexSrc.match(/paginatedJiraSearch\(\s*`project = FELT AND component.*?status not in.*?`,\s*'([^']*)'/s);
   assert(fetchJiraMatch, 'found fetchJiraIssues paginatedJiraSearch call');
   assert(fetchJiraMatch[1].includes('resolution'), 'fetchJiraIssues fields include resolution');
   assert(fetchJiraMatch[1].includes('reporter'), 'fetchJiraIssues fields include reporter');
@@ -792,7 +792,7 @@ const baseIssue = {
 };
 
 {
-  // With PRs — field is ADF doc with URLs as text nodes separated by hardBreaks
+  // With PRs on update — field is ADF doc with URLs as text nodes separated by hardBreaks
   const issue = {
     ...baseIssue,
     closedByPullRequestsReferences: {
@@ -802,12 +802,18 @@ const baseIssue = {
       ],
     },
   };
-  const result = buildJiraIssueData(issue, false);
+  const result = buildJiraIssueData(issue, true);
   const field = result.fields['customfield_10875'];
   assertEqual(field?.type, 'doc', 'customfield_10875 is ADF doc');
   const text = extractTextFromADF(field).trim();
   assert(text.includes('pull/200'), 'ADF contains first PR URL');
   assert(text.includes('pull/201'), 'ADF contains second PR URL');
+
+  // On create the field is omitted: FELT has it on the edit screen but not the create
+  // screen, so setting it there would be rejected. It is written on the next update.
+  const createResult = buildJiraIssueData(issue, false);
+  assert(!('customfield_10875' in createResult.fields),
+    'customfield_10875 omitted on create even when PRs are present');
 }
 
 {
@@ -816,13 +822,13 @@ const baseIssue = {
     ...baseIssue,
     closedByPullRequestsReferences: { nodes: [] },
   };
-  const result = buildJiraIssueData(issue, false);
+  const result = buildJiraIssueData(issue, true);
   assert(!('customfield_10875' in result.fields), 'customfield_10875 not set when no PRs');
 }
 
 {
   // Missing closedByPullRequestsReferences — no crash, field not set
-  const result = buildJiraIssueData(baseIssue, false);
+  const result = buildJiraIssueData(baseIssue, true);
   assert(!('customfield_10875' in result.fields), 'customfield_10875 not set when field missing from response');
 }
 
@@ -834,7 +840,7 @@ const baseIssue = {
       nodes: [{ url: 'https://github.com/patternfly/patternfly-react/pull/300' }],
     },
   };
-  const result = buildJiraIssueData(issue, false);
+  const result = buildJiraIssueData(issue, true);
   const field = result.fields['customfield_10875'];
   assertEqual(field?.type, 'doc', 'single PR customfield_10875 is ADF doc');
   const para = field.content[0];
@@ -993,6 +999,107 @@ console.log('\n=== INVALID_INPUT description fallback ===');
   const syncSrc = readFileSync(join(__dirname, '../src/syncJiraToGitHub.js'), 'utf-8');
   assert(syncSrc.includes('UNSYNCABLE_DESCRIPTION_MARKER'),
     'syncTitleAndDescriptionToGitHub skips the fallback (UNSYNCABLE_DESCRIPTION_MARKER) so the original GitHub description is preserved');
+}
+
+// ─── Jira project routing (everything syncs to FELT) ─────────────────────────
+
+console.log('\n=== Jira project routing ===');
+
+{
+  // buildJiraIssueData creates every repo's issues in the FELT project
+  const rhdsIssue = {
+    title: 'RHDS issue',
+    url: 'https://github.com/RedHat-UX/red-hat-design-system/issues/42',
+    body: 'An RHDS issue.',
+    number: 42,
+    labels: { nodes: [] },
+    assignees: { nodes: [] },
+    author: { login: 'testuser' },
+    issueType: null,
+  };
+  const rhdsResult = buildJiraIssueData(rhdsIssue, false);
+  assertEqual(rhdsResult.fields.project.key, 'FELT', 'RHDS issue creates in FELT project');
+
+  const pfIssue = {
+    title: 'PF issue',
+    url: 'https://github.com/patternfly/patternfly-react/issues/42',
+    body: 'A PF issue.',
+    number: 42,
+    labels: { nodes: [] },
+    assignees: { nodes: [] },
+    author: { login: 'testuser' },
+    issueType: null,
+  };
+  const pfResult = buildJiraIssueData(pfIssue, false);
+  assertEqual(pfResult.fields.project.key, 'FELT', 'PF repo issue creates in FELT project');
+
+  // Updates must never set the project field (project is immutable on update)
+  const updateResult = buildJiraIssueData(rhdsIssue, true);
+  assert(updateResult.fields.project === undefined, 'update does not set project field');
+}
+
+{
+  // Every JQL lookup and child-issue create targets FELT; no stale PF project literals remain
+  for (const file of ['index.js', 'findJiraIssue.js', 'syncJiraToGitHub.js', 'createJiraIssue.js', 'helpers.js']) {
+    const src = readFileSync(join(__dirname, `../src/${file}`), 'utf-8');
+    assert(!/project = PF\b/.test(src) && !/key: 'PF'/.test(src), `${file} has no hardcoded PF project reference`);
+  }
+  const findSrc = readFileSync(join(__dirname, '../src/findJiraIssue.js'), 'utf-8');
+  assert(findSrc.includes('project = FELT AND description'), 'findJiraIssue looks up existing issues in FELT');
+  const childSrc = readFileSync(join(__dirname, '../src/createJiraIssue.js'), 'utf-8');
+  assert(/project:\s*\{\s*key: 'FELT'/.test(childSrc), 'child issues are created in FELT');
+}
+
+{
+  // extractJiraKeyFromText matches current (FELT) and legacy (PF) keys.
+  assertEqual(extractJiraKeyFromText('tracked in FELT-1234 now'), 'FELT-1234', 'matches FELT key');
+  assertEqual(extractJiraKeyFromText('**Jira Issue:** [PF-680](url)'), 'PF-680', 'matches legacy PF key');
+  assertEqual(extractJiraKeyFromText('no key here'), null, 'returns null when no key present');
+}
+
+// ─── index.js guards sync execution behind an entry-point check ──────────────
+
+console.log('\n=== index.js execution guard ===');
+
+{
+  // index.js is imported (via findJiraIssue.js) for the shared jiraIssues cache.
+  // Its top-level sync run must be guarded so an import never triggers a live sync.
+  const indexSrc = readFileSync(join(__dirname, '../src/index.js'), 'utf-8');
+  assert(indexSrc.includes('import.meta.url') && indexSrc.includes('process.argv[1]'),
+    'index.js guards the run with an import.meta.url / process.argv[1] entry check');
+  assert(/if\s*\(entryHref && import\.meta\.url === entryHref\)/.test(indexSrc),
+    'the syncIssues loop + printSummary run only when executed as the entry point');
+}
+
+// ─── RedHat-UX bot token selection (getOctokitForOwner) ──────────────────────
+
+console.log('\n=== RedHat-UX bot token selection ===');
+
+{
+  const savedToken = process.env.GH_JIRA_SYNC_RHDS_PAT;
+
+  // Missing token for the RedHat-UX org should throw
+  delete process.env.GH_JIRA_SYNC_RHDS_PAT;
+  let threw = false;
+  try {
+    getOctokitForOwner('RedHat-UX');
+  } catch (e) {
+    threw = true;
+    assert(e.message.includes('RedHat-UX'), 'error names the RedHat-UX owner when token missing');
+  }
+  assert(threw, 'getOctokitForOwner throws when RedHat-UX token is missing');
+
+  // With the token set, an Octokit instance is returned (and cached)
+  process.env.GH_JIRA_SYNC_RHDS_PAT = 'test-rhds-token';
+  const instance = getOctokitForOwner('RedHat-UX');
+  assert(!!instance, 'getOctokitForOwner returns an instance when RedHat-UX token is set');
+
+  // Restore original env state
+  if (savedToken === undefined) {
+    delete process.env.GH_JIRA_SYNC_RHDS_PAT;
+  } else {
+    process.env.GH_JIRA_SYNC_RHDS_PAT = savedToken;
+  }
 }
 
 // ─── Summary ────────────────────────────────────────────────────────────────
