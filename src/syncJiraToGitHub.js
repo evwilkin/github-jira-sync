@@ -18,12 +18,13 @@ import {
   extractTextFromADF,
   appendMetadataToADF,
   adfToMarkdown,
-  UNSYNCABLE_DESCRIPTION_MARKER,
 } from './helpers.js';
 import { errorCollector, syncStats } from './logging.js';
 import j2m from 'jira2md';
 
-// Convert Jira description (ADF or legacy string) to GitHub Markdown, preserving formatting
+// Convert Jira description (ADF or legacy string) to GitHub Markdown, preserving formatting.
+// Only used to build the body of a GitHub issue created from a manually created Jira issue;
+// it is never used to overwrite the body of an existing GitHub issue.
 function jiraDescriptionToMarkdown(description) {
   if (!description) return '';
   // Jira Cloud v3 API returns ADF object; convert to markdown and strip sync metadata
@@ -100,60 +101,6 @@ export async function syncTitleToGitHub(jiraIssue, githubIssue) {
   }
 }
 
-// Normalize body for comparison — strips whitespace artifacts introduced by the ADF roundtrip
-// so that semantically identical descriptions compare as equal.
-function normalizeBody(body) {
-  if (body == null) return '';
-  return String(body)
-    .replace(/\r\n/g, '\n')
-    .replace(/<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*\/?>/gi, '![image]($1)')  // normalize HTML img to markdown (ADF roundtrip)
-    .replace(/[ \t]+$/gm, '')     // strip trailing whitespace per line
-    .replace(/^[ \t]+/gm, '')     // strip leading whitespace (Jira strips leading spaces from ADF text nodes)
-    .replace(/\n{3,}/g, '\n\n')   // collapse excess blank lines to max one
-    .replace(/^(#{1,6} [^\n]+)\n(?!\n)/gm, '$1\n\n')  // add blank line after headings (ADF roundtrip always produces this)
-    .trim();
-}
-
-// Sync description/body from Jira to GitHub
-export async function syncDescriptionToGitHub(jiraIssue, githubIssue) {
-  try {
-    if (!shouldSyncFromJira(githubIssue, jiraIssue)) {
-      return false;
-    }
-
-    const markdownDescription = jiraDescriptionToMarkdown(jiraIssue.fields.description);
-    // Remove trailing horizontal rule(s) that may have leaked from incomplete metadata stripping
-    const cleanDescription = markdownDescription.replace(/(\n-{3,})+\s*$/, '').trim();
-    const newBody = `${cleanDescription}${jiraLinkFooter(jiraIssue.key)}`;
-
-    const currentBody = normalizeBody(githubIssue.body);
-    const proposedBody = normalizeBody(newBody);
-    if (currentBody === proposedBody) {
-      return false;
-    }
-
-    const parsed = parseGitHubUrl(githubIssue.url);
-    if (!parsed) {
-      console.log(`  - Could not parse GitHub URL: ${githubIssue.url}`);
-      return false;
-    }
-
-    const { owner, repo, issueNumber } = parsed;
-    await updateGitHubIssue(owner, repo, issueNumber, { body: newBody });
-
-    console.log(
-      `  ✓ Synced description from Jira ${jiraIssue.key} → GitHub issue #${githubIssue.number}`
-    );
-    return true;
-  } catch (error) {
-    errorCollector.addError(
-      `SYNCJIRATOGITHUB: Error syncing description from Jira ${jiraIssue.key} to GitHub`,
-      error
-    );
-    return false;
-  }
-}
-
 // Sync assignee from Jira to GitHub
 export async function syncAssigneeToGitHub(jiraIssue, githubIssue) {
   try {
@@ -220,76 +167,7 @@ export async function syncAssigneeToGitHub(jiraIssue, githubIssue) {
   }
 }
 
-// Sync title + description from Jira to GitHub in a single REST call
-// Returns an object with { title, description } booleans indicating what changed
-export async function syncTitleAndDescriptionToGitHub(jiraIssue, githubIssue) {
-  const result = { title: false, description: false };
-  try {
-    if (!shouldSyncFromJira(githubIssue, jiraIssue)) {
-      return result;
-    }
-
-    const updates = {};
-
-    // Check title
-    const jiraSummary = jiraIssue.fields?.summary;
-    if (jiraSummary && jiraSummary !== (githubIssue.title || '')) {
-      updates.title = jiraSummary;
-      result.title = true;
-    }
-
-    // Check description
-    const markdownDescription = jiraDescriptionToMarkdown(jiraIssue.fields.description);
-    const cleanDescription = markdownDescription.replace(/(\n-{3,})+\s*$/, '').trim();
-
-    // Don't sync placeholder Jira descriptions back to GitHub — GitHub has the full content.
-    // Covers both the size-truncation notice and the INVALID_INPUT fallback; syncing either
-    // back would overwrite the real (un-syncable) GitHub body and lose it.
-    if (
-      !cleanDescription.includes('Issue description was truncated due to size') &&
-      !cleanDescription.includes(UNSYNCABLE_DESCRIPTION_MARKER)
-    ) {
-      const newBody = `${cleanDescription}${jiraLinkFooter(jiraIssue.key)}`;
-
-      const currentBody = normalizeBody(githubIssue.body);
-      const proposedBody = normalizeBody(newBody);
-      if (currentBody !== proposedBody) {
-        updates.body = newBody;
-        result.description = true;
-      }
-    }
-
-    // Skip if nothing changed
-    if (Object.keys(updates).length === 0) {
-      return result;
-    }
-
-    const parsed = parseGitHubUrl(githubIssue.url);
-    if (!parsed) {
-      console.log(`  - Could not parse GitHub URL: ${githubIssue.url}`);
-      return { title: false, description: false };
-    }
-
-    const { owner, repo, issueNumber } = parsed;
-    await updateGitHubIssue(owner, repo, issueNumber, updates);
-
-    const changed = [];
-    if (result.title) changed.push('title');
-    if (result.description) changed.push('description');
-    console.log(
-      `  ✓ Synced ${changed.join(' + ')} from Jira ${jiraIssue.key} → GitHub issue #${githubIssue.number}`
-    );
-    return result;
-  } catch (error) {
-    errorCollector.addError(
-      `SYNCJIRATOGITHUB: Error syncing title/description from Jira ${jiraIssue.key} to GitHub`,
-      error
-    );
-    return { title: false, description: false };
-  }
-}
-
-// Footer we append when adding Jira link (must match syncDescriptionToGitHub so we don't duplicate)
+// Footer appended to the GitHub issue body when adding the Jira link
 function jiraLinkFooter(jiraIssueKey) {
   const jiraLink = `https://redhat.atlassian.net/browse/${jiraIssueKey}`;
   return `\n\n---\n\n**Jira Issue:** [${jiraIssueKey}](${jiraLink})`;
@@ -851,21 +729,19 @@ export async function syncUpdatedJiraIssuesToGitHub(recentlyUpdatedJiraIssues, r
         const reopenedResult = await reopenGitHubIssueIfJiraReopened(jiraIssue, githubIssue);
         if (reopenedResult) syncResults.push('reopened');
 
-        // Sync title + description + assignee from Jira to GitHub
-        // Title and description are combined into a single REST call
-        const [titleDescResult, assigneeResult] = await Promise.all([
-          syncTitleAndDescriptionToGitHub(jiraIssue, githubIssue),
+        // Sync title + assignee from Jira to GitHub.
+        // The description is intentionally NOT synced back: GitHub is the source of truth for the
+        // body, and Jira's copy can be a lossy rendering of it (see README).
+        const [titleResult, assigneeResult] = await Promise.all([
+          syncTitleToGitHub(jiraIssue, githubIssue),
           syncAssigneeToGitHub(jiraIssue, githubIssue),
         ]);
-        if (titleDescResult.title) syncResults.push('title');
-        if (titleDescResult.description) syncResults.push('description');
+        if (titleResult) syncResults.push('title');
         if (assigneeResult) syncResults.push('assignee');
 
-        // Add Jira link to GitHub issue body (skip if description was just updated — it includes the footer)
-        if (!titleDescResult.description) {
-          const linkResult = await addJiraLinkToGitHub(jiraIssue.key, githubIssue);
-          if (linkResult) syncResults.push('link');
-        }
+        // Add Jira link to GitHub issue body
+        const linkResult = await addJiraLinkToGitHub(jiraIssue.key, githubIssue);
+        if (linkResult) syncResults.push('link');
 
         if (syncResults.length > 0) {
           console.log(

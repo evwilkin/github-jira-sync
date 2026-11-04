@@ -1230,7 +1230,10 @@ function adfBlocksToMarkdown(blocks, options = {}) {
       case 'codeblock': {
         const lang = node.attrs?.language ?? '';
         const text = adfInlineToMarkdown(node.content || []);
-        out.push('```' + (lang ? lang + '\n' : '\n') + text + '\n```');
+        // Use a fence longer than any backtick run in the code so nested fences survive
+        const longestRun = Math.max(0, ...(text.match(/`+/g) || []).map((r) => r.length));
+        const fence = '`'.repeat(Math.max(3, longestRun + 1));
+        out.push(fence + (lang ? lang + '\n' : '\n') + text + '\n' + fence);
         break;
       }
       case 'bulletlist': {
@@ -1321,7 +1324,9 @@ function adfBlocksToMarkdown(blocks, options = {}) {
       case 'mediasingle': {
         const mediaChild = (node.content || []).find((c) => adfNodeType(c) === 'media');
         if (mediaChild?.attrs?.url) {
-          out.push(`![image](${mediaChild.attrs.url})`);
+          // Keep the original alt text; escape `]` and drop line breaks so it can't break the syntax
+          const alt = String(mediaChild.attrs.alt || 'image').replace(/[\r\n]+/g, ' ').replace(/\]/g, '\\]');
+          out.push(`![${alt}](${mediaChild.attrs.url})`);
         }
         break;
       }
@@ -1385,12 +1390,36 @@ export function adfToMarkdown(adf, options = {}) {
   return adfBlocksToMarkdown(content).replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// Normalize Markdown for deciding whether two renderings of the same description really differ.
+// Ignores spellings and layout that don't change what a reader sees — blank lines, indentation,
+// trailing spaces, `*`/`+` vs `-` bullets, `_x_` vs `*x*`, and `<img>` vs `![alt](src)` — so a
+// Jira description is only rewritten when its content changed, not on every GitHub touch.
+export function normalizeMarkdownForCompare(text) {
+  return String(text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/<img\b[^>]*>/gi, (tag) => {
+      const src = (tag.match(/\bsrc=["']([^"']+)["']/i) || [])[1];
+      if (!src) return tag;
+      const alt = (tag.match(/\balt=["']([^"']*)["']/i) || [])[1] || 'image';
+      return `![${alt.replace(/\]/g, '\\]')}](${src})`;
+    })
+    .replace(/[ \t]+$/gm, '')
+    .replace(/^[ \t]+/gm, '')
+    .replace(/^[*+] /gm, '- ')
+    .replace(/(^|[^\w])_([^_\n]+)_(?=[^\w]|$)/g, '$1*$2*')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+}
+
 // --- ADF Write Helpers ---
 
 // Parse inline Markdown text into ADF inline content nodes
 function parseMarkdownInline(text) {
   const nodes = [];
-  const pattern = /(~~(.+?)~~)|(~([^~]+?)~)|(\*\*(.+?)\*\*)|(\*(.+?)\*)|(_(.+?)_)|(`(.+?)`)|(!\[([^\]]*)\]\(([^)]+)\))|(\[([^\]]+)\]\(([^)]+)\))/g;
+  // Emphasis follows the usual Markdown flanking rules: the marker must hug the text (no space
+  // just inside it), and `_` only counts at a word boundary, so snake_case words and `2 * 3 * 4`
+  // are left alone instead of being turned into italics.
+  const pattern = /(~~(.+?)~~)|(~([^~]+?)~)|(\*\*(?!\s)(.+?)(?<!\s)\*\*)|(\*(?![\s*])(.+?)(?<![\s*])\*)|((?<![A-Za-z0-9_])_(?![\s_])(.+?)(?<![\s_])_(?![A-Za-z0-9_]))|(`(.+?)`)|(!\[([^\]]*)\]\(([^)]+)\))|(\[([^\]]+)\]\(([^)]+)\))/g;
   let lastIndex = 0;
   let match;
   while ((match = pattern.exec(text)) !== null) {
@@ -1456,12 +1485,14 @@ function markdownToADFBlocks(markdown) {
       continue;
     }
 
-    // Fenced code block: ```
-    if (line.startsWith('```')) {
-      const lang = line.slice(3).trim();
+    // Fenced code block: ``` (a longer fence, e.g. ``````, can contain shorter ones)
+    const fenceMatch = line.match(/^(`{3,})(.*)$/);
+    if (fenceMatch) {
+      const lang = fenceMatch[2].trim();
+      const closingFence = new RegExp('^`{' + fenceMatch[1].length + ',}\\s*$');
       const codeLines = [];
       i++;
-      while (i < lines.length && !lines[i].startsWith('```')) {
+      while (i < lines.length && !closingFence.test(lines[i])) {
         codeLines.push(lines[i]);
         i++;
       }
@@ -1572,23 +1603,25 @@ function markdownToADFBlocks(markdown) {
       mdImageRegex.lastIndex = 0;
       let remaining = line;
       const mediaNodes = [];
-      // Extract <img> tags
+      // Extract <img> tags (alt text is kept; width/height are not)
       let imgMatch;
       while ((imgMatch = imgTagRegex.exec(line)) !== null) {
+        const alt = (imgMatch[0].match(/\balt=["']([^"']*)["']/i) || [])[1];
         mediaNodes.push({
           type: 'mediaSingle',
           attrs: { layout: 'center' },
-          content: [{ type: 'media', attrs: { type: 'external', url: imgMatch[1] } }],
+          content: [{ type: 'media', attrs: { type: 'external', url: imgMatch[1], ...(alt && { alt }) } }],
         });
         remaining = remaining.replace(imgMatch[0], '');
       }
       // Extract ![alt](url) markdown images
       let mdMatch;
       while ((mdMatch = mdImageRegex.exec(line)) !== null) {
+        const alt = mdMatch[1];
         mediaNodes.push({
           type: 'mediaSingle',
           attrs: { layout: 'center' },
-          content: [{ type: 'media', attrs: { type: 'external', url: mdMatch[2] } }],
+          content: [{ type: 'media', attrs: { type: 'external', url: mdMatch[2], ...(alt && { alt }) } }],
         });
         remaining = remaining.replace(mdMatch[0], '');
       }

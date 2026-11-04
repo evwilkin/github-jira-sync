@@ -8,13 +8,14 @@ import {
   shouldSyncFromGitHub,
   extractTextFromADF,
   adfToMarkdown,
+  normalizeMarkdownForCompare,
   executeGraphQLQuery,
 } from './helpers.js';
 import { transitionJiraIssue } from './transitionJiraIssue.js';
 import { createChildIssues } from './createJiraIssue.js';
 import { findJiraIssue } from './findJiraIssue.js';
 import { errorCollector, syncStats } from './logging.js';
-import { syncAssigneeToGitHub, addJiraLinkToGitHub, syncTitleAndDescriptionToGitHub, closeGitHubIssueIfJiraClosed, reopenGitHubIssueIfJiraReopened, parseGitHubUrl, buildBatchedIssueStateQuery } from './syncJiraToGitHub.js';
+import { syncAssigneeToGitHub, addJiraLinkToGitHub, syncTitleToGitHub, closeGitHubIssueIfJiraClosed, reopenGitHubIssueIfJiraReopened, parseGitHubUrl, buildBatchedIssueStateQuery } from './syncJiraToGitHub.js';
 
 async function findChildIssues(jiraIssueKey) {
   try {
@@ -195,7 +196,6 @@ export async function updateJiraIssue(jiraIssue, githubIssue) {
         title: false,
         assignee: false,
         link: false,
-        description: false,
         closed: false,
         reopened: false,
       },
@@ -248,20 +248,12 @@ export async function updateJiraIssue(jiraIssue, githubIssue) {
         // Both truncated — no meaningful change
         descriptionChanged = false;
       } else {
-        // Normalize both sides the same way to ignore ADF roundtrip whitespace artifacts
-        // (e.g. blank lines added after headings, leading spaces stripped by Jira).
-        const normalizeForCompare = (text) => String(text || '')
-          .replace(/\r\n/g, '\n')
-          .replace(/<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*\/?>/gi, '![image]($1)')  // normalize HTML img to markdown (ADF roundtrip)
-          .replace(/[ \t]+$/gm, '')
-          .replace(/^[ \t]+/gm, '')
-          .replace(/\n{3,}/g, '\n\n')
-          .replace(/^(#{1,6} [^\n]+)\n(?!\n)/gm, '$1\n\n')
-          .trim();
+        // Normalize both sides the same way so ADF roundtrip artifacts (blank lines, indentation,
+        // bullet and italic spellings, <img> vs ![alt](src)) don't count as a change.
         const githubBodyClean = (githubIssue.body || '')
           .replace(/\n{0,2}-{3,}\n{0,2}\*\*Jira Issue:\*\*[^\n]*/g, '').trim();
         descriptionChanged =
-          normalizeForCompare(currentJiraMarkdown) !== normalizeForCompare(githubBodyClean);
+          normalizeMarkdownForCompare(currentJiraMarkdown) !== normalizeMarkdownForCompare(githubBodyClean);
       }
       if (!descriptionChanged) {
         delete jiraIssueData.fields.description;
@@ -348,21 +340,18 @@ export async function updateJiraIssue(jiraIssue, githubIssue) {
     }
 
     // Reverse sync: Always attempt to sync from Jira to GitHub
-    // These functions check timestamps internally and will skip if GitHub is newer
-    // Combined title+description into a single REST call; assignee uses a separate endpoint
-    const [titleDescResult, assigneeResult] = await Promise.all([
-      syncTitleAndDescriptionToGitHub(jiraIssue, githubIssue),
+    // These functions check timestamps internally and will skip if GitHub is newer.
+    // The description is intentionally NOT synced back: GitHub is the source of truth for the
+    // body, and Jira's copy can be a lossy rendering of it (see README).
+    const [titleResult, assigneeResult] = await Promise.all([
+      syncTitleToGitHub(jiraIssue, githubIssue),
       syncAssigneeToGitHub(jiraIssue, githubIssue),
     ]);
-    if (titleDescResult.title) syncSummary.jiraToGitHub.title = true;
-    if (titleDescResult.description) syncSummary.jiraToGitHub.description = true;
+    if (titleResult) syncSummary.jiraToGitHub.title = true;
     if (assigneeResult) syncSummary.jiraToGitHub.assignee = true;
 
-    // Skip adding Jira link when description was just updated – the new body already includes the canonical footer
-    if (!titleDescResult.description) {
-      const linkResult = await addJiraLinkToGitHub(jiraIssue.key, githubIssue);
-      if (linkResult) syncSummary.jiraToGitHub.link = true;
-    }
+    const linkResult = await addJiraLinkToGitHub(jiraIssue.key, githubIssue);
+    if (linkResult) syncSummary.jiraToGitHub.link = true;
 
     // Log summary
     const summaryParts = [];

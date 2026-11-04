@@ -13,7 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Import exported functions directly
 import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGitHub.js';
-import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER } from '../src/helpers.js';
+import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown } from '../src/helpers.js';
 import { syncStats, errorCollector, markRunFailedIfErrors } from '../src/logging.js';
 
 let passed = 0;
@@ -527,27 +527,56 @@ console.log('\n=== Description truncation for oversized issues ===');
   assert(updateText.includes('truncated due to size'), 'update mode also truncates oversized descriptions');
 }
 
-// ─── Truncated descriptions don't sync back to GitHub ────────────────────────
+// ─── A Jira description never overwrites a GitHub issue body ─────────────────
+// Jira's copy of a description can be a lossy rendering of the GitHub body (issues created
+// before the ADF writer went through Jira's wiki-markup conversion), and any Jira activity
+// (sprint, rank, Team automation, status) makes Jira "newer". Pushing it back rewrote 346
+// GitHub bodies and broke links, code names and tables. GitHub is the source of truth.
 
-console.log('\n=== Truncated descriptions never sync back to GitHub ===');
+console.log('\n=== Jira descriptions never overwrite a GitHub body ===');
 
 {
   const syncSrc = readFileSync(join(__dirname, '../src/syncJiraToGitHub.js'), 'utf-8');
+  const updateSrc = readFileSync(join(__dirname, '../src/updateJiraIssue.js'), 'utf-8');
 
-  // Verify syncTitleAndDescriptionToGitHub checks for truncation before syncing description
-  assert(
-    syncSrc.includes("Issue description was truncated due to size"),
-    'syncTitleAndDescriptionToGitHub checks for truncation notice'
-  );
+  // The functions that pushed a description to GitHub are gone
+  assert(!/function syncTitleAndDescriptionToGitHub/.test(syncSrc), 'syncTitleAndDescriptionToGitHub no longer exists');
+  assert(!/function syncDescriptionToGitHub/.test(syncSrc), 'syncDescriptionToGitHub no longer exists');
+  assert(!/syncTitleAndDescriptionToGitHub|syncDescriptionToGitHub/.test(updateSrc), 'updateJiraIssue does not call a description push');
 
-  // Verify the truncation check prevents updating the body
-  // The guard should be before the `updates.body = newBody` assignment
-  const truncationCheckIdx = syncSrc.indexOf('Issue description was truncated due to size');
-  const updatesBodyIdx = syncSrc.indexOf('updates.body = newBody');
-  assert(
-    truncationCheckIdx < updatesBodyIdx,
-    'truncation guard appears before body update assignment'
-  );
+  // The only GitHub write that carries a body on the Jira->GitHub paths is the footer append
+  // (addJiraLinkToGitHub) and creating a brand-new issue from a manual Jira issue.
+  const fnSource = (name) => { const m = syncSrc.match(new RegExp(`(?:export )?(?:async )?function ${name}\\b[\\s\\S]*?\\n}\\n`)); return m ? m[0] : ''; };
+  const bodyWrites = syncSrc.match(/updateGitHubIssue\([^)]*\{[^}]*\bbody\b[^}]*\}\s*\)/g) || [];
+  const footerFn = fnSource('addJiraLinkToGitHub');
+  assertEqual(bodyWrites.length, 1, 'exactly one updateGitHubIssue call writes a body');
+  assert(bodyWrites.length === 1 && footerFn.includes(bodyWrites[0].split('\n')[0].trim().slice(0, 30)), 'the only body write is the footer append in addJiraLinkToGitHub');
+
+  // The title sync writes only the title, never a body
+  const titleFn = fnSource('syncTitleToGitHub');
+  assert(titleFn.length > 0 && !/\bbody\b/.test(titleFn), 'syncTitleToGitHub never touches the body');
+  assert(syncSrc.includes('syncTitleToGitHub(jiraIssue, githubIssue)') && updateSrc.includes('syncTitleToGitHub(jiraIssue, githubIssue)'),
+    'both Jira->GitHub paths use the title-only sync');
+}
+
+{
+  // Behaviour: Jira is newer and its description differs, but the titles match -> nothing is written
+  // (syncTitleToGitHub returns false before any network call).
+  const { syncTitleToGitHub } = await import('../src/syncJiraToGitHub.js');
+  const jiraIssue = { key: 'FELT-1', fields: { summary: 'Same title', updated: '2026-11-04T15:30:00.000+0000', description: { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Jira-side rendering that differs from GitHub' }] }] } } };
+  const githubIssue = { number: 1, url: 'https://github.com/patternfly/patternfly/issues/1', title: 'Same title', body: 'The original GitHub body', updatedAt: '2026-11-01T00:00:00Z' };
+  assertEqual(await syncTitleToGitHub(jiraIssue, githubIssue), false, 'Jira newer + different description + same title -> no write');
+}
+
+{
+  // The state right after a GitHub->Jira write must not trigger anything either direction:
+  // Jira was just updated (T0) and GitHub was last touched within 60s of it (footer append) or earlier.
+  const T0 = '2026-11-04T10:00:00.000+0000';
+  const jira = { fields: { updated: T0 } };
+  assertEqual(shouldSyncFromGitHub({ updatedAt: '2026-11-04T10:00:05Z' }, jira), false, 'GitHub 5s after the Jira write is a tie -> GitHub->Jira description compare is skipped');
+  assertEqual(shouldSyncFromGitHub({ updatedAt: '2026-11-04T09:00:00Z' }, jira), false, 'GitHub older than Jira -> GitHub->Jira is skipped');
+  // ...and a real, later GitHub change (>= 60s after Jira) is the only thing that rewrites Jira again
+  assertEqual(shouldSyncFromGitHub({ updatedAt: '2026-11-04T10:02:00Z' }, jira), true, 'a genuinely newer GitHub update still syncs GitHub->Jira');
 }
 
 // ─── Paginated Jira search ────────────────────────────────────────────────────
@@ -979,7 +1008,7 @@ console.log('\n=== INVALID_INPUT description fallback ===');
   assert(!hasEmptyTextNode(fallback), 'fallback contains no empty text nodes');
   assertEqual(extractUpstreamUrl(fallback), url, 'fallback preserves the Upstream URL marker for link matching');
   assert(extractTextFromADF(fallback).includes('could not be synced'), 'fallback includes the explanatory notice');
-  assert(extractTextFromADF(fallback).includes(UNSYNCABLE_DESCRIPTION_MARKER), 'fallback contains the unsyncable marker so it is never pushed back to GitHub');
+  assert(extractTextFromADF(fallback).includes(UNSYNCABLE_DESCRIPTION_MARKER), 'fallback contains the marker that identifies it as a placeholder');
 
   // No Upstream URL present → still valid, just the notice (no footer)
   const noUrl = buildSafeDescriptionADF({ type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: 'nothing here' }] }] });
@@ -994,11 +1023,32 @@ console.log('\n=== INVALID_INPUT description fallback ===');
     'createNewJiraIssue retries on INVALID_INPUT with a safe description');
   assert(/export async function editJiraIssue[\s\S]*isInvalidInputError[\s\S]*buildSafeDescriptionADF/.test(helpersSrc),
     'editJiraIssue retries on INVALID_INPUT with a safe description');
+}
 
-  // The Jira→GitHub description sync must skip the fallback so it never overwrites the GitHub body
-  const syncSrc = readFileSync(join(__dirname, '../src/syncJiraToGitHub.js'), 'utf-8');
-  assert(syncSrc.includes('UNSYNCABLE_DESCRIPTION_MARKER'),
-    'syncTitleAndDescriptionToGitHub skips the fallback (UNSYNCABLE_DESCRIPTION_MARKER) so the original GitHub description is preserved');
+// ─── "Did the description change?" ignores layout, so a GitHub touch doesn't rewrite Jira ─────
+// Jira's exporter lays lists out differently from GitHub (blank line between items, `-` bullets,
+// `*italic*`, `![alt](src)` for <img>). Treating that as a change rewrote Jira's description on
+// every GitHub update (89 of 342 unchanged real bodies were flagged "changed").
+
+console.log('\n=== Description comparison ignores layout, not content ===');
+
+{
+  const same = (a, b) => normalizeMarkdownForCompare(a) === normalizeMarkdownForCompare(b);
+  assert(same('- a\n- b', '- a\n\n- b'), 'blank lines between list items are ignored');
+  assert(same('* a\n+ b', '- a\n- b'), '* and + bullets equal - bullets');
+  assert(same('an _italic_ word', 'an *italic* word'), '_italic_ equals *italic*');
+  assert(same('<img width="10" alt="Shot" src="https://e.com/a.png" />', '![Shot](https://e.com/a.png)'), '<img> equals the markdown image with the same alt');
+  assert(!same('<img alt="One" src="https://e.com/a.png">', '![Two](https://e.com/a.png)'), 'a different alt text is a real change');
+  assert(same('  indented\r\ntext  ', 'indented\ntext'), 'indentation, trailing spaces and CRLF are ignored');
+  // real edits are still seen
+  assert(!same('Hello world', 'Hello there world'), 'a reworded sentence is a change');
+  assert(!same('- a\n- b', '- a\n- b\n- c'), 'an added list item is a change');
+  assert(!same('```\na\nb\n```', '```\na b\n```'), 'merging two code lines is a change');
+  assert(!same('snake_case_word', 'snake*case*word'), 'underscores inside a word are not treated as italics');
+  // end to end: a typical GitHub body compares equal to what Jira's copy exports back
+  const body = '## Steps\n\n* open the page\n* click the _button_\n\n<img width="10" alt="Screenshot" src="https://e.com/s.png" />\n\nUse `foo_bar` here.';
+  const exported = adfToMarkdown(buildDescriptionADF(body, { number: 1, url: 'u', reporter: 'x', assignees: '' }), { stripMetadata: true });
+  assert(same(body, exported), 'a body compares equal to its own Jira round trip (no needless rewrite)');
 }
 
 // ─── Jira project routing (everything syncs to FELT) ─────────────────────────
