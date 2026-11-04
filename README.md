@@ -54,19 +54,20 @@ The sync tool operates in **two directions** with **timestamp-based conflict res
 
 **Jira → GitHub Sync** (Reverse direction):
 - Syncs assignees from Jira to GitHub (when Jira was updated more recently)
-- Syncs issue titles and descriptions from Jira to GitHub (when Jira was updated more recently)
+- Syncs issue titles from Jira to GitHub (when Jira was updated more recently)
 - Adds Jira issue links to GitHub issue descriptions and comments
 - Closes GitHub issues when their corresponding Jira issues are closed
 - Reopens GitHub issues when their corresponding Jira issues are reopened
+- **Descriptions are never synced from Jira to GitHub.** GitHub is the source of truth for an issue's body. Jira's copy can be a lossy rendering of it (older issues were written through Jira's wiki-markup conversion), and any Jira activity — a sprint change, a status change, an automation — makes Jira look newer, so pushing it back would overwrite the original GitHub body with the degraded copy. Edit the description on GitHub; the next sync updates Jira. The one exception is a GitHub issue created by the sync from a manually created Jira issue, whose initial body comes from Jira.
 
 ### Conflict Resolution
 
-The sync uses a **"last updated wins"** strategy:
+The sync uses a **"last updated wins"** strategy for the fields it syncs in both directions (titles, assignees, status):
 - If GitHub was updated more recently → GitHub changes sync to Jira
 - If Jira was updated more recently → Jira changes sync to GitHub
 - If timestamps are equal or missing → Jira is treated as the source of truth
 
-This ensures that manual updates in either system are preserved and synced correctly.
+Descriptions are the exception: they only flow from GitHub to Jira.
 
 ### Sync Order
 
@@ -119,7 +120,7 @@ npm run sync:since 01-01-2025
 - **Complete Comment Sync**: Transfers all GitHub issue comments to corresponding Jira issues
 - **Markdown Conversion**: Converts GitHub Markdown to Jira markup format automatically
 - **Large Comment Handling**: Automatically truncates oversized comments with reference links
-- **Content Updates**: Syncs issue titles, descriptions, labels, and assignees
+- **Content Updates**: Syncs issue titles, labels, and assignees; descriptions flow from GitHub to Jira only
 
 ### Issue Hierarchy Management
 - **Parent/Child Relationships**: Handles GitHub sub-issues as Jira child issues or Epic children
