@@ -164,7 +164,7 @@ buildRunner(`
   const blocks = markdownToADFBlocks(md);
   const reversed = adfBlocksToMarkdown(blocks);
 
-  this.assert(reversed.includes('![image](https://example.com/image.png)'), 'round-trip produces markdown image: ' + JSON.stringify(reversed));
+  this.assert(reversed.includes('![screenshot](https://example.com/image.png)'), 'round-trip keeps the alt text: ' + JSON.stringify(reversed));
 `).call({ assert, randomUUID });
 
 // ─── Mixed content: text + img on same line ─────────────────────────────────
@@ -396,6 +396,82 @@ buildRunner(`
   this.assert(content[2].marks[0].type === 'strike', 'third is strikethrough');
   this.assert(content[2].text === 'struck', 'strike text correct');
   this.assert(content[4].marks[0].type === 'em', 'fifth is italic');
+`).call({ assert, randomUUID });
+
+// ─── Image alt text is preserved (47 of 342 real issue bodies lost it) ───────
+
+console.log('\n=== Image alt text survives the round trip ===');
+
+buildRunner(`
+  const roundTrip = (md) => adfBlocksToMarkdown(markdownToADFBlocks(md));
+
+  // Markdown image: alt stored on the media node and exported again
+  const mdBlocks = markdownToADFBlocks('![Screen Shot 2022-01-19 at 8.50.45 PM](https://example.com/a.png)');
+  this.assert(mdBlocks[0].content[0].attrs.alt === 'Screen Shot 2022-01-19 at 8.50.45 PM', 'markdown image alt is kept on the media node');
+  this.assert(roundTrip('![Screen Shot 2022-01-19 at 8.50.45 PM](https://example.com/a.png)') === '![Screen Shot 2022-01-19 at 8.50.45 PM](https://example.com/a.png)', 'markdown image round-trips unchanged');
+
+  // <img> tag: alt kept; width/height are intentionally not
+  const imgBlocks = markdownToADFBlocks('<img width="1439" alt="Image" src="https://example.com/b.png" />');
+  this.assert(imgBlocks[0].content[0].attrs.alt === 'Image', '<img> alt is kept on the media node');
+  this.assert(roundTrip('<img width="1439" alt="Image" src="https://example.com/b.png" />') === '![Image](https://example.com/b.png)', '<img> exports as a markdown image with its alt');
+
+  // No alt anywhere: no alt attribute is invented, export falls back to "image"
+  const bare = markdownToADFBlocks('<img src="https://example.com/c.png">');
+  this.assert(!('alt' in bare[0].content[0].attrs), 'no alt attribute when the source has none');
+  this.assert(roundTrip('<img src="https://example.com/c.png">') === '![image](https://example.com/c.png)', 'missing alt falls back to "image"');
+
+  // Alt text can't break the markdown syntax
+  const odd = adfBlocksToMarkdown([{ type: 'mediaSingle', attrs: { layout: 'center' }, content: [{ type: 'media', attrs: { type: 'external', url: 'https://example.com/d.png', alt: 'a] b\\nc' } }] }]);
+  this.assert(odd === '![a\\\\] b c](https://example.com/d.png)', 'closing bracket is escaped and line breaks removed: ' + JSON.stringify(odd));
+`).call({ assert, randomUUID });
+
+// ─── Emphasis: snake_case and spaced asterisks are not italics ───────────────
+
+console.log('\n=== Emphasis does not fire inside words or around spaced asterisks ===');
+
+buildRunner(`
+  const text = (md) => parseMarkdownInline(md).map((n) => n.text).join('');
+  const marked = (md) => parseMarkdownInline(md).filter((n) => n.marks && n.marks.length).length;
+
+  // snake_case outside code used to become italics ("foo*bar and baz*qux")
+  this.assert(marked('use foo_bar and baz_qux here') === 0, 'snake_case words are not italicised');
+  this.assert(text('use foo_bar and baz_qux here') === 'use foo_bar and baz_qux here', 'snake_case text is unchanged');
+
+  // an underscore before a code span must not swallow the code span
+  const nodes = parseMarkdownInline('see foo_bar and then \`code_x\` too');
+  this.assert(nodes.some((n) => n.text === 'code_x' && n.marks && n.marks[0].type === 'code'), 'code span keeps its underscore and code mark');
+  this.assert(text('see foo_bar and then \`code_x\` too').includes('foo_bar'), 'text before the code span keeps its underscore');
+
+  // spaced asterisks are arithmetic / literal, not emphasis
+  this.assert(marked('2 * 3 * 4') === 0, 'spaced asterisks are not italics');
+
+  // real emphasis still works
+  const real = parseMarkdownInline('an _italic_ word, an *italic* word and **bold**');
+  this.assert(real.filter((n) => n.marks && n.marks[0].type === 'em').length === 2, '_italic_ and *italic* at word boundaries still become italics');
+  this.assert(real.filter((n) => n.marks && n.marks[0].type === 'strong').length === 1, '**bold** still becomes bold');
+  this.assert(marked('(_italic_)') === 1 && marked('_italic_.') === 1, 'underscore emphasis works next to punctuation');
+`).call({ assert, randomUUID });
+
+// ─── Fenced code blocks honour the fence length ──────────────────────────────
+
+console.log('\n=== Longer code fences can contain shorter ones ===');
+
+buildRunner(`
+  const md = '\`\`\`\`\`\`\\n\`\`\`hbs isBeta\\n\`\`\`\\n\`\`\`\`\`\`';
+  const blocks = markdownToADFBlocks(md);
+  this.assert(blocks.length === 1 && blocks[0].type === 'codeBlock', 'a six-backtick fence is one code block, not shredded paragraphs');
+  this.assert(blocks[0].content[0].text === '\`\`\`hbs isBeta\\n\`\`\`', 'the inner three-backtick lines stay inside the block');
+
+  // export picks a fence longer than anything inside, and re-parsing gives the same code back
+  const exported = adfBlocksToMarkdown(blocks);
+  this.assert(exported.startsWith('\`\`\`\`\\n') && exported.endsWith('\\n\`\`\`\`'), 'export fence is longer than the nested fence: ' + JSON.stringify(exported));
+  const again = markdownToADFBlocks(exported);
+  this.assert(again.length === 1 && again[0].content[0].text === blocks[0].content[0].text, 'exported block re-parses to the same code');
+
+  // ordinary three-backtick blocks are unchanged
+  const plain = markdownToADFBlocks('\`\`\`js\\nconst a = 1;\\n\`\`\`');
+  this.assert(plain.length === 1 && plain[0].attrs.language === 'js' && plain[0].content[0].text === 'const a = 1;', 'plain fenced block unchanged');
+  this.assert(adfBlocksToMarkdown(plain) === '\`\`\`js\\nconst a = 1;\\n\`\`\`', 'plain fenced block exports with a three-backtick fence');
 `).call({ assert, randomUUID });
 
 // ─── Summary ────────────────────────────────────────────────────────────────

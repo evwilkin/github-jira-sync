@@ -8,6 +8,7 @@ import {
   shouldSyncFromGitHub,
   extractTextFromADF,
   adfToMarkdown,
+  normalizeMarkdownForCompare,
   executeGraphQLQuery,
 } from './helpers.js';
 import { transitionJiraIssue } from './transitionJiraIssue.js';
@@ -247,20 +248,12 @@ export async function updateJiraIssue(jiraIssue, githubIssue) {
         // Both truncated — no meaningful change
         descriptionChanged = false;
       } else {
-        // Normalize both sides the same way to ignore ADF roundtrip whitespace artifacts
-        // (e.g. blank lines added after headings, leading spaces stripped by Jira).
-        const normalizeForCompare = (text) => String(text || '')
-          .replace(/\r\n/g, '\n')
-          .replace(/<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*\/?>/gi, '![image]($1)')  // normalize HTML img to markdown (ADF roundtrip)
-          .replace(/[ \t]+$/gm, '')
-          .replace(/^[ \t]+/gm, '')
-          .replace(/\n{3,}/g, '\n\n')
-          .replace(/^(#{1,6} [^\n]+)\n(?!\n)/gm, '$1\n\n')
-          .trim();
+        // Normalize both sides the same way so ADF roundtrip artifacts (blank lines, indentation,
+        // bullet and italic spellings, <img> vs ![alt](src)) don't count as a change.
         const githubBodyClean = (githubIssue.body || '')
           .replace(/\n{0,2}-{3,}\n{0,2}\*\*Jira Issue:\*\*[^\n]*/g, '').trim();
         descriptionChanged =
-          normalizeForCompare(currentJiraMarkdown) !== normalizeForCompare(githubBodyClean);
+          normalizeMarkdownForCompare(currentJiraMarkdown) !== normalizeMarkdownForCompare(githubBodyClean);
       }
       if (!descriptionChanged) {
         delete jiraIssueData.fields.description;

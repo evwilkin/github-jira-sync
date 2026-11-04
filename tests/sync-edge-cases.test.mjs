@@ -13,7 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Import exported functions directly
 import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGitHub.js';
-import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub } from '../src/helpers.js';
+import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown } from '../src/helpers.js';
 import { syncStats, errorCollector, markRunFailedIfErrors } from '../src/logging.js';
 
 let passed = 0;
@@ -1023,6 +1023,32 @@ console.log('\n=== INVALID_INPUT description fallback ===');
     'createNewJiraIssue retries on INVALID_INPUT with a safe description');
   assert(/export async function editJiraIssue[\s\S]*isInvalidInputError[\s\S]*buildSafeDescriptionADF/.test(helpersSrc),
     'editJiraIssue retries on INVALID_INPUT with a safe description');
+}
+
+// ─── "Did the description change?" ignores layout, so a GitHub touch doesn't rewrite Jira ─────
+// Jira's exporter lays lists out differently from GitHub (blank line between items, `-` bullets,
+// `*italic*`, `![alt](src)` for <img>). Treating that as a change rewrote Jira's description on
+// every GitHub update (89 of 342 unchanged real bodies were flagged "changed").
+
+console.log('\n=== Description comparison ignores layout, not content ===');
+
+{
+  const same = (a, b) => normalizeMarkdownForCompare(a) === normalizeMarkdownForCompare(b);
+  assert(same('- a\n- b', '- a\n\n- b'), 'blank lines between list items are ignored');
+  assert(same('* a\n+ b', '- a\n- b'), '* and + bullets equal - bullets');
+  assert(same('an _italic_ word', 'an *italic* word'), '_italic_ equals *italic*');
+  assert(same('<img width="10" alt="Shot" src="https://e.com/a.png" />', '![Shot](https://e.com/a.png)'), '<img> equals the markdown image with the same alt');
+  assert(!same('<img alt="One" src="https://e.com/a.png">', '![Two](https://e.com/a.png)'), 'a different alt text is a real change');
+  assert(same('  indented\r\ntext  ', 'indented\ntext'), 'indentation, trailing spaces and CRLF are ignored');
+  // real edits are still seen
+  assert(!same('Hello world', 'Hello there world'), 'a reworded sentence is a change');
+  assert(!same('- a\n- b', '- a\n- b\n- c'), 'an added list item is a change');
+  assert(!same('```\na\nb\n```', '```\na b\n```'), 'merging two code lines is a change');
+  assert(!same('snake_case_word', 'snake*case*word'), 'underscores inside a word are not treated as italics');
+  // end to end: a typical GitHub body compares equal to what Jira's copy exports back
+  const body = '## Steps\n\n* open the page\n* click the _button_\n\n<img width="10" alt="Screenshot" src="https://e.com/s.png" />\n\nUse `foo_bar` here.';
+  const exported = adfToMarkdown(buildDescriptionADF(body, { number: 1, url: 'u', reporter: 'x', assignees: '' }), { stripMetadata: true });
+  assert(same(body, exported), 'a body compares equal to its own Jira round trip (no needless rewrite)');
 }
 
 // ─── Jira project routing (everything syncs to FELT) ─────────────────────────
