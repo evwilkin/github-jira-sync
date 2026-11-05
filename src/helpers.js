@@ -188,10 +188,25 @@ export async function createNewJiraIssue(jiraIssueData, githubIssue) {
   }
 }
 
+// Jira edits made by the sync mirror changes that already happened on GitHub, so they should not
+// email the reporter, watchers and assignee. `notifyUsers=false` needs Administer Projects (or
+// Administer Jira) on the project; if Jira rejects the flag instead of ignoring it, retry once
+// without it so a missing permission can never stop the edit itself. Only the issue-edit endpoint
+// supports this flag: creating issues, adding comments and changing status still notify.
+async function putJiraIssue(jiraIssueKey, data) {
+  const url = `/rest/api/3/issue/${jiraIssueKey}`;
+  try {
+    await jiraClient.put(url, data, { params: { notifyUsers: false } });
+  } catch (error) {
+    if (error?.response?.status !== 403) throw error;
+    await jiraClient.put(url, data);
+  }
+}
+
 export async function editJiraIssue(jiraIssueKey, jiraIssueData) {
   await delay();
   try {
-    await jiraClient.put(`/rest/api/3/issue/${jiraIssueKey}`, jiraIssueData);
+    await putJiraIssue(jiraIssueKey, jiraIssueData);
   } catch (error) {
     // Same INVALID_INPUT fallback as create: retry once with a safe description.
     if (isInvalidInputError(error) && jiraIssueData.fields?.description) {
@@ -206,7 +221,7 @@ export async function editJiraIssue(jiraIssueKey, jiraIssueData) {
         },
       };
       await delay();
-      await jiraClient.put(`/rest/api/3/issue/${jiraIssueKey}`, retryData);
+      await putJiraIssue(jiraIssueKey, retryData);
     } else {
       throw error;
     }

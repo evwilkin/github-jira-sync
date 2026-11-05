@@ -13,7 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Import exported functions directly
 import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGitHub.js';
-import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown } from '../src/helpers.js';
+import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, jiraClient } from '../src/helpers.js';
 import { syncStats, errorCollector, markRunFailedIfErrors } from '../src/logging.js';
 
 let passed = 0;
@@ -1049,6 +1049,64 @@ console.log('\n=== Description comparison ignores layout, not content ===');
   const body = '## Steps\n\n* open the page\n* click the _button_\n\n<img width="10" alt="Screenshot" src="https://e.com/s.png" />\n\nUse `foo_bar` here.';
   const exported = adfToMarkdown(buildDescriptionADF(body, { number: 1, url: 'u', reporter: 'x', assignees: '' }), { stripMetadata: true });
   assert(same(body, exported), 'a body compares equal to its own Jira round trip (no needless rewrite)');
+}
+
+// ─── Jira edits made by the sync don't email people ──────────────────────────
+// The sync mirrors changes that already happened on GitHub, so each Jira edit used to email the
+// reporter, watchers and assignee. Edits now send notifyUsers=false (needs Administer Projects).
+
+console.log('\n=== Jira edits suppress notification emails ===');
+
+{
+  const realPut = jiraClient.put;
+  const calls = [];
+  const stub = (impl) => { calls.length = 0; jiraClient.put = async (url, data, config) => { calls.push({ url, data, config }); return impl(calls.length); }; };
+  const httpError = (status, data = {}) => Object.assign(new Error(`HTTP ${status}`), { response: { status, data } });
+  const attempt = async (fn) => { try { await fn(); return null; } catch (e) { return e; } };
+  try {
+    // a normal edit asks Jira not to send the notification
+    stub(() => ({ status: 204 }));
+    await editJiraIssue('FELT-1', { fields: { summary: 'x' } });
+    assertEqual(calls.length, 1, 'a normal edit makes one PUT');
+    assertEqual(calls[0].url, '/rest/api/3/issue/FELT-1', 'the PUT targets the issue');
+    assertEqual(calls[0].config?.params?.notifyUsers, false, 'the edit sends notifyUsers=false');
+    assertEqual(calls[0].data.fields.summary, 'x', 'the body is passed through unchanged');
+
+    // the INVALID_INPUT fallback retry is silent too
+    stub((n) => { if (n === 1) throw httpError(400, { errorMessages: ['INVALID_INPUT'], errors: {} }); return { status: 204 }; });
+    const adf = { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Upstream URL: https://github.com/patternfly/patternfly/issues/1' }] }] };
+    await editJiraIssue('FELT-2', { fields: { description: adf } });
+    assertEqual(calls.length, 2, 'INVALID_INPUT triggers exactly one retry');
+    assert(calls.every((c) => c.config?.params?.notifyUsers === false), 'both the first attempt and the fallback retry send notifyUsers=false');
+    assert(JSON.stringify(calls[1].data).includes(UNSYNCABLE_DESCRIPTION_MARKER), 'the retry carries the safe fallback description');
+
+    // if Jira rejects the flag (403), the edit is retried once without it so it still lands
+    stub((n) => { if (n === 1) throw httpError(403); return { status: 204 }; });
+    const rejected = await attempt(() => editJiraIssue('FELT-3', { fields: { summary: 'y' } }));
+    assertEqual(rejected, null, 'a 403 on the flag does not fail the edit');
+    assertEqual(calls.length, 2, 'the rejected flag costs exactly one extra PUT');
+    assertEqual(calls[1].config, undefined, 'the retry is sent without notifyUsers');
+
+    // a genuine 403 (retry also refused) still surfaces
+    stub(() => { throw httpError(403); });
+    const denied = await attempt(() => editJiraIssue('FELT-4', { fields: { summary: 'z' } }));
+    assertEqual(denied?.response?.status, 403, 'a real permission failure still throws');
+    assertEqual(calls.length, 2, 'it is not retried more than once');
+
+    // other errors pass through untouched on the first attempt (updateJiraIssue's assignee retry relies on this)
+    const assigneeErr = httpError(400, { errorMessages: [], errors: { assignee: 'cannot be assigned' } });
+    stub(() => { throw assigneeErr; });
+    const passed = await attempt(() => editJiraIssue('FELT-5', { fields: { assignee: { accountId: 'a' } } }));
+    assertEqual(passed, assigneeErr, 'a non-403 error is rethrown as is');
+    assertEqual(calls.length, 1, 'and is not retried');
+  } finally {
+    jiraClient.put = realPut;
+  }
+
+  // no other code path writes to Jira's issue-edit endpoint, so none can skip the flag
+  const helpersSrc = readFileSync(join(__dirname, '../src/helpers.js'), 'utf-8');
+  const putCalls = [...helpersSrc.matchAll(/jiraClient\.put\(/g)].length;
+  assertEqual(putCalls, 2, 'jiraClient.put appears only inside putJiraIssue (flag + 403 fallback)');
 }
 
 // ─── Jira project routing (everything syncs to FELT) ─────────────────────────

@@ -38,6 +38,8 @@ This Node.js application automatically synchronizes issues between GitHub and Ji
    ```
    For Jira Cloud, use your **Atlassian account email** and an [API token](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/).
 
+   **Jira notification emails:** edits the sync makes to existing Jira issues are sent with `notifyUsers=false`, so they don't email the reporter, watchers and assignee. Jira only honors this when the sync account has **Administer Projects** on the FELT project; without it Jira may ignore the flag (the sync retries once without it if Jira rejects it) and edits email as usual. The flag exists only on the issue-edit call, so creating issues, adding comments and changing status still send notifications.
+
    Repos are synced across multiple GitHub orgs, and each org uses its own token (see `getOctokitForOwner` in `src/helpers.js`): `patternfly` → `GH_TOKEN`, `rh-uxd` → `GH_JIRA_SYNC_RHUXD_PAT`, `RedHat-UX` → `GH_JIRA_SYNC_RHDS_PAT`.
    
 ## How Sync Works
