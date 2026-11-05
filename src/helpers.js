@@ -115,6 +115,15 @@ export async function addRemoteLinkToJiraIssue(jiraIssueKey, githubIssue) {
 // content — most often a description whose ADF is malformed (e.g. empty text nodes,
 // nested expands, or relative link hrefs produced from Renovate "Dependency Dashboard"
 // issue bodies). The errors map is empty in this case, so we match on the message.
+// Jira summaries created by another integration carry a "[owner/repo] " prefix that the
+// GitHub title never has. Strip only the current repo's prefix so a title compare (or a
+// Jira -> GitHub title write) doesn't treat it as a rename and prefix the GitHub title.
+export function stripRepoPrefix(summary, owner, repo) {
+  if (typeof summary !== 'string' || !owner || !repo) return summary;
+  const prefix = `[${owner}/${repo}] `;
+  return summary.startsWith(prefix) ? summary.slice(prefix.length) : summary;
+}
+
 export function isInvalidInputError(error) {
   const messages = error?.response?.data?.errorMessages;
   return (

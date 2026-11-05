@@ -9,6 +9,7 @@ import {
   extractTextFromADF,
   adfToMarkdown,
   normalizeMarkdownForCompare,
+  stripRepoPrefix,
   executeGraphQLQuery,
 } from './helpers.js';
 import { transitionJiraIssue } from './transitionJiraIssue.js';
@@ -260,7 +261,10 @@ export async function updateJiraIssue(jiraIssue, githubIssue) {
       }
 
       // Check what changed (compare meaningful fields)
-      const titleChanged = jiraIssue.fields.summary !== githubIssue.title;
+      const parsedForTitle = parseGitHubUrl(githubIssue.url);
+      const titleChanged = (parsedForTitle
+        ? stripRepoPrefix(jiraIssue.fields.summary, parsedForTitle.owner, parsedForTitle.repo)
+        : jiraIssue.fields.summary) !== githubIssue.title;
       const hadGitHubAssignee = githubIssue.assignees?.nodes?.length > 0;
       const assigneeChanged = !hadAssignee && hadGitHubAssignee;
 
