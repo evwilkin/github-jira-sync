@@ -18,6 +18,7 @@ import {
   extractTextFromADF,
   appendMetadataToADF,
   adfToMarkdown,
+  stripRepoPrefix,
 } from './helpers.js';
 import { errorCollector, syncStats } from './logging.js';
 import j2m from 'jira2md';
@@ -64,16 +65,9 @@ export async function syncTitleToGitHub(jiraIssue, githubIssue) {
       return false; // Skip syncing title from Jira to GitHub
     }
 
-    const jiraSummary = jiraIssue.fields?.summary;
-    if (!jiraSummary) {
+    const rawSummary = jiraIssue.fields?.summary;
+    if (!rawSummary) {
       return false; // No summary in Jira
-    }
-
-    const githubTitle = githubIssue.title || '';
-    
-    // Only update if titles are different
-    if (jiraSummary === githubTitle) {
-      return false; // Titles match, no update needed
     }
 
     const parsed = parseGitHubUrl(githubIssue.url);
@@ -83,6 +77,13 @@ export async function syncTitleToGitHub(jiraIssue, githubIssue) {
     }
 
     const { owner, repo, issueNumber } = parsed;
+    const jiraSummary = stripRepoPrefix(rawSummary, owner, repo);
+    const githubTitle = githubIssue.title || '';
+
+    // Only update if titles are different
+    if (jiraSummary === githubTitle) {
+      return false; // Titles match, no update needed
+    }
 
     await updateGitHubIssue(owner, repo, issueNumber, {
       title: jiraSummary,

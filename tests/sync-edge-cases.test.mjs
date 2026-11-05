@@ -13,7 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Import exported functions directly
 import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGitHub.js';
-import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, syncCommentsToJira, jiraClient } from '../src/helpers.js';
+import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, syncCommentsToJira, stripRepoPrefix, jiraClient } from '../src/helpers.js';
 import { syncStats, errorCollector, markRunFailedIfErrors } from '../src/logging.js';
 
 let passed = 0;
@@ -1265,6 +1265,36 @@ console.log('\n=== Comment sync dedupe ===');
     jiraClient.get = realGet;
     jiraClient.post = realPost;
   }
+}
+
+// ─── Repo prefix in Jira summaries ──────────────────────────────────────────
+
+// Another integration created ~950 Jira summaries as "[owner/repo] <title>". GitHub titles never
+// carry that prefix, so copying the Jira summary onto GitHub prefixed real GitHub titles
+// (RedHat-UX/red-hat-design-system#3334, #3336).
+
+console.log('\n=== Repo prefix in Jira summaries ===');
+
+{
+  assertEqual(stripRepoPrefix('[RedHat-UX/red-hat-design-system] [focus] rh-x: y', 'RedHat-UX', 'red-hat-design-system'), '[focus] rh-x: y', 'the current repo prefix is removed');
+  assertEqual(stripRepoPrefix('[patternfly/patternfly-react] Fix it', 'patternfly', 'patternfly-react'), 'Fix it', 'works for patternfly repos too');
+  assertEqual(stripRepoPrefix('[patternfly/patternfly] Fix it', 'patternfly', 'patternfly-react'), '[patternfly/patternfly] Fix it', "another repo's prefix is left alone");
+  assertEqual(stripRepoPrefix('Fix [RedHat-UX/red-hat-design-system] later', 'RedHat-UX', 'red-hat-design-system'), 'Fix [RedHat-UX/red-hat-design-system] later', 'only a leading prefix is removed');
+  assertEqual(stripRepoPrefix('[RedHat-UX/red-hat-design-system]no space', 'RedHat-UX', 'red-hat-design-system'), '[RedHat-UX/red-hat-design-system]no space', 'the prefix needs its trailing space');
+  assertEqual(stripRepoPrefix(undefined, 'a', 'b'), undefined, 'a missing summary passes through');
+
+  // Jira newer, summary only differs by the prefix -> nothing is written (returns before any network call)
+  const { syncTitleToGitHub } = await import('../src/syncJiraToGitHub.js');
+  const jiraIssue = { key: 'FELT-4835', fields: { summary: '[RedHat-UX/red-hat-design-system] [focus] rh-video-embed: use :focus-visible', updated: '2026-11-05T15:03:50.800+0000' } };
+  const githubIssue = { number: 3334, url: 'https://github.com/RedHat-UX/red-hat-design-system/issues/3334', title: '[focus] rh-video-embed: use :focus-visible', updatedAt: '2026-11-04T19:56:37Z' };
+  assertEqual(await syncTitleToGitHub(jiraIssue, githubIssue), false, 'Jira newer + prefix-only difference -> GitHub title is not rewritten');
+
+  // the compare and the written value both go through stripRepoPrefix
+  const syncSrc = readFileSync(join(__dirname, '../src/syncJiraToGitHub.js'), 'utf-8');
+  const titleFn = syncSrc.slice(syncSrc.indexOf('export async function syncTitleToGitHub'));
+  assert(/const jiraSummary = stripRepoPrefix\(rawSummary, owner, repo\)/.test(titleFn) && /title: jiraSummary,/.test(titleFn), 'a real title change is written without the prefix');
+  const updateSrc = readFileSync(join(__dirname, '../src/updateJiraIssue.js'), 'utf-8');
+  assert(/stripRepoPrefix\(jiraIssue\.fields\.summary, parsedForTitle\.owner, parsedForTitle\.repo\)/.test(updateSrc), 'the GitHub->Jira title-changed check ignores the prefix too');
 }
 
 // ─── Summary ────────────────────────────────────────────────────────────────
