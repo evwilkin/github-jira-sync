@@ -13,7 +13,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Import exported functions directly
 import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGitHub.js';
-import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, jiraClient } from '../src/helpers.js';
+import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, syncCommentsToJira, jiraClient } from '../src/helpers.js';
 import { syncStats, errorCollector, markRunFailedIfErrors } from '../src/logging.js';
 
 let passed = 0;
@@ -1207,6 +1207,63 @@ console.log('\n=== RedHat-UX bot token selection ===');
     delete process.env.GH_JIRA_SYNC_RHDS_PAT;
   } else {
     process.env.GH_JIRA_SYNC_RHDS_PAT = savedToken;
+  }
+}
+
+// ─── Comment dedupe (other upstream-sync integration + paging) ─────────────
+
+// ants-engineering copied GitHub comments into Jira as "[<comment id>] Upstream, <author> wrote ...:"
+// with no "Comment URL:" line, so our URL-only dedupe would post every one of them a second time.
+// Jira also pages the comment list, so comments beyond the first page looked missing.
+
+console.log('\n=== Comment sync dedupe ===');
+
+{
+  const realGet = jiraClient.get;
+  const realPost = jiraClient.post;
+  const adfText = (text) => ({ type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] });
+  const url = (id) => `https://github.com/RedHat-UX/red-hat-design-system/issues/3335#issuecomment-${id}`;
+  const gh = (id, body = 'hello') => ({ url: url(id), body, author: { login: 'someone' }, createdAt: '2026-10-30T00:00:00Z' });
+  const posted = [];
+  const run = async (jiraPages, ghComments) => {
+    posted.length = 0;
+    const getParams = [];
+    jiraClient.get = async (u, config) => {
+      getParams.push(config?.params);
+      const { startAt = 0, maxResults = 50 } = config?.params || {};
+      const all = jiraPages;
+      return { data: { startAt, maxResults, total: all.length, comments: all.slice(startAt, startAt + maxResults) } };
+    };
+    jiraClient.post = async (u, data) => { posted.push(data); return { status: 201 }; };
+    await syncCommentsToJira('FELT-1', { nodes: [...ghComments].reverse() });
+    return getParams;
+  };
+  try {
+    // other tool's comment suppresses the matching GitHub comment; an unmatched one still posts
+    await run([{ body: adfText('[6530628024] Upstream, Adam Johnson wrote [Fri Oct 30]:> text') }], [gh(6530628024), gh(111)]);
+    assertEqual(posted.length, 1, 'only the GitHub comment the other tool has not copied is posted');
+    assert(JSON.stringify(posted[0]).includes(url(111)), 'the posted comment is the unmatched one');
+
+    // our own format still dedupes
+    await run([{ body: adfText(`Comment Author: x\nComment URL: ${url(222)}`) }], [gh(222)]);
+    assertEqual(posted.length, 0, 'a comment with our Comment URL line is not posted again');
+
+    // "Upstream issue closed" style messages (no id) neither match nor break anything
+    await run([{ body: adfText('Upstream issue closed. Attempting transition to Closed.') }], [gh(333)]);
+    assertEqual(posted.length, 1, 'a message without a comment id does not suppress real comments');
+
+    // id match is exact, not a prefix: [60] must not hide #issuecomment-6030
+    await run([{ body: adfText('[60] Upstream, A wrote [x]:y') }], [gh(6030)]);
+    assertEqual(posted.length, 1, 'the comment id must match exactly');
+
+    // comments beyond Jira's first page are still seen
+    const many = Array.from({ length: 130 }, (_, i) => ({ body: adfText(`[${1000 + i}] Upstream, A wrote [x]:y`) }));
+    const params = await run(many, [gh(1000), gh(1129)]);
+    assertEqual(posted.length, 0, 'comments on later pages still suppress duplicates');
+    assertEqual(params.length, 2, 'the comment list is read page by page (130 comments, 100 per page)');
+  } finally {
+    jiraClient.get = realGet;
+    jiraClient.post = realPost;
   }
 }
 
