@@ -2009,26 +2009,37 @@ export async function closeGitHubIssue(owner, repo, issueNumber) {
 
 export async function syncCommentsToJira(jiraIssueKey, githubComments) {
   try {
-    // Get existing comments from Jira (read-only, use shorter delay)
-    await shortDelay();
-    const { data: jiraComments } = await jiraClient.get(
-      `/rest/api/3/issue/${jiraIssueKey}/comment`
-    );
+    // Get existing comments from Jira (read-only, use shorter delay).
+    // Jira pages this endpoint (50 by default), so read every page or older comments look missing.
+    const jiraComments = { comments: [] };
+    for (let startAt = 0; ; ) {
+      await shortDelay();
+      const { data } = await jiraClient.get(
+        `/rest/api/3/issue/${jiraIssueKey}/comment`,
+        { params: { startAt, maxResults: 100 } }
+      );
+      const page = data.comments || [];
+      jiraComments.comments.push(...page);
+      startAt += page.length;
+      if (page.length === 0 || startAt >= (data.total ?? startAt)) break;
+    }
 
     // Create a map of existing comments by their GitHub URL
     // comment.body is ADF in v3, so extract plain text before matching
-    const existingComments = new Map(
-      jiraComments.comments
-        .map((comment) => {
-          const bodyText = extractTextFromADF(comment.body);
-          // Match either "Comment URL: " or "Full comment available at: " plus the comment link (for truncated comments)
-          const githubUrlMatch =
-            bodyText.match(/Comment URL: (.*)/) ||
-            bodyText.match(/Full comment available at: (.*)/);
-          return githubUrlMatch ? [githubUrlMatch[1].trim(), comment] : null;
-        })
-        .filter(Boolean)
-    );
+    const existingComments = new Map();
+    // GitHub comment ids already copied by the other upstream-sync integration, which writes
+    // "[<comment id>] Upstream, <author> wrote [<date>]:" and no "Comment URL:" line
+    const upstreamCommentIds = new Set();
+    for (const comment of jiraComments.comments) {
+      const bodyText = extractTextFromADF(comment.body);
+      // Match either "Comment URL: " or "Full comment available at: " plus the comment link (for truncated comments)
+      const githubUrlMatch =
+        bodyText.match(/Comment URL: (.*)/) ||
+        bodyText.match(/Full comment available at: (.*)/);
+      if (githubUrlMatch) existingComments.set(githubUrlMatch[1].trim(), comment);
+      const upstreamMatch = bodyText.match(/^\[(\d+)\] Upstream, /);
+      if (upstreamMatch) upstreamCommentIds.add(upstreamMatch[1]);
+    }
 
     // Reverse comments to add oldest first to match Jira comment order (oldest at bottom, newest at top)
     const githubCommentsAscending = githubComments.nodes.reverse();
@@ -2049,6 +2060,10 @@ export async function syncCommentsToJira(jiraIssueKey, githubComments) {
         existingComments.delete(comment.url);
         continue;
       }
+
+      // Skip if the other integration already copied this comment (matched by GitHub comment id)
+      const commentId = String(comment.url || '').match(/#issuecomment-(\d+)$/)?.[1];
+      if (commentId && upstreamCommentIds.has(commentId)) continue;
 
       // Build ADF comment body with GitHub metadata header/footer
       let commentBody = buildCommentADF(comment);
