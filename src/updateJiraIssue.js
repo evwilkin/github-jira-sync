@@ -18,6 +18,27 @@ import { findJiraIssue } from './findJiraIssue.js';
 import { errorCollector, syncStats } from './logging.js';
 import { syncAssigneeToGitHub, addJiraLinkToGitHub, syncTitleToGitHub, closeGitHubIssueIfJiraClosed, reopenGitHubIssueIfJiraReopened, parseGitHubUrl, buildBatchedIssueStateQuery } from './syncJiraToGitHub.js';
 
+// Jira refuses a parent link that breaks its issue hierarchy (e.g. a Story under a Story). That is a
+// known limitation of syncing GitHub sub-issues, not a failure, so it is reported as a warning.
+export function isHierarchyError(error) {
+  if (error?.response?.status !== 400) return false;
+  return /hierarchy/i.test(JSON.stringify(error.response.data ?? ''));
+}
+
+// The parent (or epic link) a Jira issue already has, or null. A person may have placed it there on purpose,
+// so the sync must not move it to match GitHub's sub-issue tree.
+export async function getExistingParentKey(jiraIssueKey) {
+  try {
+    await shortDelay();
+    const { data } = await jiraClient.get(`/rest/api/3/issue/${jiraIssueKey}`, {
+      params: { fields: 'parent,customfield_10014' },
+    });
+    return data.fields?.parent?.key || data.fields?.customfield_10014 || null;
+  } catch {
+    return null;
+  }
+}
+
 async function findChildIssues(jiraIssueKey) {
   try {
     await shortDelay();
@@ -89,7 +110,18 @@ export async function updateChildIssues(parentJiraKey, githubIssue, isEpic) {
                 : ` !! - ChildIssue: Error creating child of ${parentJiraKey} (GH #${subIssue.number})`
             );
           } else {
-            // Link existing Jira issue as a child of the parent
+            // Link existing Jira issue as a child of the parent, unless it already has a different parent
+            const existingParent = await getExistingParentKey(jiraIssue.key);
+            if (existingParent && existingParent !== parentJiraKey) {
+              console.log(
+                `  ! - Skipping ${jiraIssue.key}: already a child of ${existingParent} in Jira, not moving it to ${parentJiraKey} (GH #${subIssue.number})`
+              );
+              syncStats.track('warnings', { key: jiraIssue.key, message: `Kept existing parent ${existingParent}; GitHub sub-issue of ${parentJiraKey} not applied` });
+              if (subIssue.comments?.totalCount > 0) {
+                await syncCommentsToJira(jiraIssue.key, subIssue.comments);
+              }
+              continue;
+            }
             const updatedData = { fields: {} };
             if (isEpic) {
               updatedData.fields['customfield_10014'] = parentJiraKey;
@@ -107,7 +139,16 @@ export async function updateChildIssues(parentJiraKey, githubIssue, isEpic) {
                 `  ! - Trying to update ${jiraIssue.key} to be a sub-task of ${parentJiraKey} may need to be done manually`
               );
             }
-            await editJiraIssue(jiraIssue.key, updatedData);
+            try {
+              await editJiraIssue(jiraIssue.key, updatedData);
+            } catch (linkError) {
+              if (!isHierarchyError(linkError)) throw linkError;
+              console.log(
+                `  ! - Skipping ${jiraIssue.key}: Jira's hierarchy does not allow it under ${parentJiraKey} (GH #${subIssue.number}); needs a manual change`
+              );
+              syncStats.track('warnings', { key: jiraIssue.key, message: `Jira hierarchy does not allow it under ${parentJiraKey}` });
+              continue;
+            }
 
             if (subIssue.comments?.totalCount > 0) {
               await syncCommentsToJira(jiraIssue.key, subIssue.comments);
