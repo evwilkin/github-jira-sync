@@ -12,7 +12,7 @@ import {
   syncUpdatedJiraIssuesToGitHub,
 } from './syncJiraToGitHub.js';
 import { syncPRLinksToJira } from './syncPRLinksToJira.js';
-import { errorCollector, syncStats, markRunFailedIfErrors } from './logging.js';
+import { errorCollector, syncStats, markRunFailedIfErrors, emitCiAnnotations, writeStepSummary } from './logging.js';
 
 export let jiraIssues = [];
 
@@ -289,6 +289,8 @@ if (entryHref && import.meta.url === entryHref) {
   }
 
   syncStats.printSummary();
+  emitCiAnnotations();
+  writeStepSummary();
 
   // Individual sync operations collect and log errors so the remaining repos
   // can still be processed. Mark the overall run failed only after the summary.

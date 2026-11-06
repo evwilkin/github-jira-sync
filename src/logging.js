@@ -1,3 +1,5 @@
+import { appendFileSync } from 'fs';
+
 // Error collector to store errors with context
 class ErrorCollector {
   constructor() {
@@ -155,6 +157,82 @@ class SyncStats {
 }
 
 export const syncStats = new SyncStats();
+
+// ─── GitHub Actions reporting ───────────────────────────────────────────────
+// A run is only green or red, but annotations show yellow warnings on the run page and the job
+// summary renders a report there. Neither changes the run's result or sends a notification.
+
+// Workflow commands treat % and newlines specially (and , and : inside properties).
+export function escapeWorkflowData(value) {
+  return String(value).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+}
+function escapeWorkflowProperty(value) {
+  return escapeWorkflowData(value).replace(/:/g, '%3A').replace(/,/g, '%2C');
+}
+
+// One warning/error per distinct message per repo, with the affected keys listed.
+function groupWarnings(warnings) {
+  const grouped = new Map();
+  for (const w of warnings) {
+    const message = typeof w === 'object' && w.message ? w.message : String(w);
+    const keys = grouped.get(message) || [];
+    if (typeof w === 'object' && w.key) keys.push(w.key);
+    grouped.set(message, keys);
+  }
+  return grouped;
+}
+
+export function emitCiAnnotations({ env = process.env, log = console.log } = {}) {
+  if (env.GITHUB_ACTIONS !== 'true') return 0;
+  let count = 0;
+  for (const [repo, stats] of syncStats.repoStats) {
+    for (const [message, keys] of groupWarnings(stats.warnings)) {
+      const text = keys.length ? `${message}: ${keys.join(', ')}` : message;
+      log(`::warning title=${escapeWorkflowProperty(repo)}::${escapeWorkflowData(text)}`);
+      count++;
+    }
+  }
+  for (const { context, message } of errorCollector.errors) {
+    log(`::error title=${escapeWorkflowProperty('Sync error')}::${escapeWorkflowData(`${context}: ${message}`)}`);
+    count++;
+  }
+  return count;
+}
+
+export function buildStepSummaryMarkdown() {
+  const rows = [...syncStats.repoStats.entries()].filter(([, s]) =>
+    s.jiraCreated + s.jiraClosed + s.githubCreated + s.githubClosed + s.githubReopened + s.errors + s.warnings.length > 0
+  );
+  const lines = ['## GitHub ↔ Jira sync', ''];
+  if (rows.length === 0) {
+    lines.push('No creates, closes, reopens, errors or warnings.', '');
+  } else {
+    lines.push('| Repo | Jira created | Jira closed | GH created | GH closed | GH reopened | Errors | Warnings |', '|---|---:|---:|---:|---:|---:|---:|---:|');
+    for (const [repo, s] of rows) {
+      lines.push(`| ${repo} | ${s.jiraCreated} | ${s.jiraClosed} | ${s.githubCreated} | ${s.githubClosed} | ${s.githubReopened} | ${s.errors} | ${s.warnings.length} |`);
+    }
+    lines.push('');
+    for (const [repo, s] of rows.filter(([, r]) => r.warnings.length > 0)) {
+      lines.push(`### Warnings: ${repo}`, '');
+      for (const [message, keys] of groupWarnings(s.warnings)) {
+        lines.push(`- ${message}${keys.length ? `: ${keys.join(', ')}` : ''}`);
+      }
+      lines.push('');
+    }
+  }
+  if (errorCollector.errors.length > 0) {
+    lines.push('### Errors', '');
+    for (const { context, message } of errorCollector.errors) lines.push(`- ${context}: ${message}`);
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+export function writeStepSummary({ env = process.env, append = appendFileSync } = {}) {
+  if (!env.GITHUB_STEP_SUMMARY) return false;
+  append(env.GITHUB_STEP_SUMMARY, buildStepSummaryMarkdown() + '\n');
+  return true;
+}
 
 export function markRunFailedIfErrors(processRef = process) {
   if (!syncStats.hasErrors()) return false;
