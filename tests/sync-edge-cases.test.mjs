@@ -14,7 +14,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Import exported functions directly
 import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGitHub.js';
 import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, syncCommentsToJira, stripRepoPrefix, jiraClient } from '../src/helpers.js';
-import { syncStats, errorCollector, markRunFailedIfErrors } from '../src/logging.js';
+import { syncStats, errorCollector, markRunFailedIfErrors, emitCiAnnotations, buildStepSummaryMarkdown, writeStepSummary, escapeWorkflowData } from '../src/logging.js';
 import { updateChildIssues, isHierarchyError, getExistingParentKey } from '../src/updateJiraIssue.js';
 import { shouldWritePrLinks, getCurrentPrField } from '../src/syncPRLinksToJira.js';
 
@@ -1396,6 +1396,55 @@ console.log('\n=== PR link writes skip unchanged values ===');
   }
   const prSrc = readFileSync(join(__dirname, '../src/syncPRLinksToJira.js'), 'utf-8');
   assert(/shouldWritePrLinks\(current, prUrls\)\) continue;[\s\S]*editJiraIssue/.test(prSrc), 'the compare runs before the Jira write');
+}
+
+// ─── GitHub Actions warnings and job summary ────────────────────────────────
+
+// A run can only be green or red; annotations and the job summary surface warnings without failing it.
+
+console.log('\n=== CI annotations and job summary ===');
+
+{
+  syncStats.repoStats.clear();
+  errorCollector.clear();
+  syncStats.setCurrentRepo('RedHat-UX/red-hat-design-system');
+  syncStats.track('warnings', { key: 'FELT-5179', message: 'Kept existing parent FELT-4799' });
+  syncStats.track('warnings', { key: 'FELT-5180', message: 'Kept existing parent FELT-4799' });
+  syncStats.track('warnings', { key: 'FELT-9', message: 'Other: 100% odd\nline' });
+  syncStats.track('jiraCreated');
+
+  const lines = [];
+  assertEqual(emitCiAnnotations({ env: {}, log: (l) => lines.push(l) }), 0, 'no annotations outside GitHub Actions');
+  assertEqual(lines.length, 0, 'and nothing is printed');
+
+  const n = emitCiAnnotations({ env: { GITHUB_ACTIONS: 'true' }, log: (l) => lines.push(l) });
+  assertEqual(n, 2, 'one warning per distinct message (3 warnings, 2 messages)');
+  assertEqual(lines[0], '::warning title=RedHat-UX/red-hat-design-system::Kept existing parent FELT-4799: FELT-5179, FELT-5180', 'same-message warnings are grouped with their keys');
+  assert(lines[1].includes('100%25 odd%0Aline'), 'percent signs and newlines are escaped');
+  assertEqual(escapeWorkflowData('a%b\r\nc'), 'a%25b%0D%0Ac', 'escapeWorkflowData escapes %, CR and LF');
+
+  const md = buildStepSummaryMarkdown();
+  assert(md.includes('| RedHat-UX/red-hat-design-system | 1 | 0 | 0 | 0 | 0 | 0 | 3 |'), 'the summary table has the repo row with counts');
+  assert(md.includes('- Kept existing parent FELT-4799: FELT-5179, FELT-5180'), 'the summary lists the grouped warnings');
+
+  let written = null;
+  assertEqual(writeStepSummary({ env: {}, append: () => { written = 'x'; } }), false, 'no summary file when GITHUB_STEP_SUMMARY is unset');
+  assertEqual(written, null, 'and nothing is written');
+  assertEqual(writeStepSummary({ env: { GITHUB_STEP_SUMMARY: '/tmp/s.md' }, append: (f, t) => { written = { f, t }; } }), true, 'the summary is appended when the file is set');
+  assert(written.f === '/tmp/s.md' && written.t.includes('## GitHub ↔ Jira sync'), 'to the named file');
+
+  errorCollector.addError('UPDATEJIRA: Error updating X', new Error('boom'));
+  const errLines = [];
+  emitCiAnnotations({ env: { GITHUB_ACTIONS: 'true' }, log: (l) => errLines.push(l) });
+  assert(errLines.some((l) => l.startsWith('::error title=Sync error::UPDATEJIRA: Error updating X: boom')), 'errors become error annotations');
+  assert(buildStepSummaryMarkdown().includes('- UPDATEJIRA: Error updating X: boom'), 'and are listed in the summary');
+  assertEqual(markRunFailedIfErrors({}), false, 'warnings alone never fail the run');
+
+  syncStats.repoStats.clear();
+  errorCollector.clear();
+  const indexSrc = readFileSync(join(__dirname, '../src/index.js'), 'utf-8');
+  assert(/printSummary\(\);\s*emitCiAnnotations\(\);\s*writeStepSummary\(\);/.test(indexSrc), 'index.js reports after the summary and before the exit code');
+  assert(/import \{[^}]*\bemitCiAnnotations\b[^}]*\bwriteStepSummary\b[^}]*\} from '\.\/logging\.js'/.test(indexSrc) || /import \{[^}]*\bwriteStepSummary\b[^}]*\bemitCiAnnotations\b[^}]*\} from '\.\/logging\.js'/.test(indexSrc), 'index.js imports the functions it calls');
 }
 
 // ─── Summary ────────────────────────────────────────────────────────────────
