@@ -16,6 +16,7 @@ import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGi
 import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, syncCommentsToJira, stripRepoPrefix, jiraClient } from '../src/helpers.js';
 import { syncStats, errorCollector, markRunFailedIfErrors } from '../src/logging.js';
 import { updateChildIssues, isHierarchyError, getExistingParentKey } from '../src/updateJiraIssue.js';
+import { shouldWritePrLinks, getCurrentPrField } from '../src/syncPRLinksToJira.js';
 
 let passed = 0;
 let failed = 0;
@@ -1363,6 +1364,38 @@ console.log('\n=== Child linking keeps existing parents ===');
     jiraClient.get = realGet;
     jiraClient.put = realPut;
   }
+}
+
+// ─── PR links are written only when they changed ────────────────────────────
+
+// syncPRLinksToJira rewrote the Git Pull Request field on every run for every issue with a recently
+// updated PR, even when the value was identical, bumping Jira's updated time each time.
+
+console.log('\n=== PR link writes skip unchanged values ===');
+
+{
+  const A = 'https://github.com/patternfly/chatbot/pull/942';
+  const B = 'https://github.com/patternfly/chatbot/pull/945';
+  assertEqual(shouldWritePrLinks(A, [A]), false, 'same single link -> no write');
+  assertEqual(shouldWritePrLinks(`${A}\n${B}`, [A, B]), false, 'same two links in the same order -> no write');
+  assertEqual(shouldWritePrLinks('', [A]), true, 'empty field -> write');
+  assertEqual(shouldWritePrLinks(A, [A, B]), true, 'a new link was added -> write');
+  assertEqual(shouldWritePrLinks(`${A}\n${B}`, [A]), true, 'a link was removed -> write');
+  assertEqual(shouldWritePrLinks(null, [A]), true, 'an unreadable field is written, as before');
+
+  const realGet = jiraClient.get;
+  try {
+    jiraClient.get = async () => ({ data: { fields: { customfield_10875: buildPrUrlsADF([A, B]) } } });
+    assertEqual(await getCurrentPrField('FELT-1'), `${A}\n${B}`, 'the current field is read back as newline-joined URLs');
+    jiraClient.get = async () => ({ data: { fields: { customfield_10875: null } } });
+    assertEqual(await getCurrentPrField('FELT-1'), '', 'a missing field reads as empty');
+    jiraClient.get = async () => { throw new Error('network'); };
+    assertEqual(await getCurrentPrField('FELT-1'), null, 'a read failure returns null');
+  } finally {
+    jiraClient.get = realGet;
+  }
+  const prSrc = readFileSync(join(__dirname, '../src/syncPRLinksToJira.js'), 'utf-8');
+  assert(/shouldWritePrLinks\(current, prUrls\)\) continue;[\s\S]*editJiraIssue/.test(prSrc), 'the compare runs before the Jira write');
 }
 
 // ─── Summary ────────────────────────────────────────────────────────────────
