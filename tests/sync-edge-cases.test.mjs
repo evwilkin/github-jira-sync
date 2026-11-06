@@ -15,6 +15,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGitHub.js';
 import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, syncCommentsToJira, stripRepoPrefix, jiraClient } from '../src/helpers.js';
 import { syncStats, errorCollector, markRunFailedIfErrors } from '../src/logging.js';
+import { updateChildIssues, isHierarchyError, getExistingParentKey } from '../src/updateJiraIssue.js';
 
 let passed = 0;
 let failed = 0;
@@ -1295,6 +1296,73 @@ console.log('\n=== Repo prefix in Jira summaries ===');
   assert(/const jiraSummary = stripRepoPrefix\(rawSummary, owner, repo\)/.test(titleFn) && /title: jiraSummary,/.test(titleFn), 'a real title change is written without the prefix');
   const updateSrc = readFileSync(join(__dirname, '../src/updateJiraIssue.js'), 'utf-8');
   assert(/stripRepoPrefix\(jiraIssue\.fields\.summary, parsedForTitle\.owner, parsedForTitle\.repo\)/.test(updateSrc), 'the GitHub->Jira title-changed check ignores the prefix too');
+}
+
+// ─── Linking existing Jira issues as children ───────────────────────────────
+
+// GitHub sub-issue #868 of #3349 maps to FELT-5179, which people had already put under FELT-4799.
+// The sync tried to re-parent it under FELT-5225 (a Story), Jira answered 400 "hierarchy", and the run
+// ended with an error. It must keep a person's parent and treat a hierarchy refusal as a warning.
+
+console.log('\n=== Child linking keeps existing parents ===');
+
+{
+  const hierarchy400 = Object.assign(new Error('400'), { response: { status: 400, data: { errorMessages: ['Given parent work item does not belong to appropriate hierarchy.'], errors: { pid: 'must be created in the same project as the parent' } } } });
+  assert(isHierarchyError(hierarchy400), 'Jira hierarchy 400 is recognised');
+  assert(!isHierarchyError(Object.assign(new Error('x'), { response: { status: 400, data: { errors: { assignee: 'bad' } } } })), 'another 400 is not a hierarchy error');
+  assert(!isHierarchyError(Object.assign(new Error('x'), { response: { status: 500, data: 'hierarchy' } })), 'a 500 is not a hierarchy error');
+  assert(!isHierarchyError(new Error('network')), 'an error with no response is not a hierarchy error');
+
+  const realGet = jiraClient.get;
+  const realPut = jiraClient.put;
+  const puts = [];
+  const adf = (t) => ({ type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: t }] }] });
+  const SUB = 'https://github.com/RedHat-UX/red-hat-design-system/issues/868';
+  const child = { key: 'FELT-5179', fields: { description: adf(`Upstream URL: ${SUB}`), status: { name: 'Refinement' }, updated: '2026-11-05T00:00:00.000+0000' } };
+  const stubJira = (parentFields, putImpl) => {
+    puts.length = 0;
+    jiraClient.get = async (url, config) => {
+      if (url.includes('/search/jql')) {
+        const jql = config?.params?.jql || '';
+        return { data: { issues: jql.startsWith('parent =') ? [] : [child] } };
+      }
+      if (/\/issue\/FELT-5179$/.test(url)) return { data: { fields: parentFields } };
+      return { data: { issues: [], comments: [], total: 0 } };
+    };
+    jiraClient.put = async (url, data, config) => { puts.push({ url, data }); return putImpl(); };
+  };
+  const gh = { number: 3349, subIssues: { totalCount: 1, nodes: [{ url: SUB, number: 868, comments: { totalCount: 0 } }] } };
+  try {
+    stubJira({ parent: { key: 'FELT-4799' } }, () => ({ status: 204 }));
+    assertEqual(await getExistingParentKey('FELT-5179'), 'FELT-4799', 'the existing parent is read');
+    stubJira({ customfield_10014: 'FELT-100' }, () => ({ status: 204 }));
+    assertEqual(await getExistingParentKey('FELT-5179'), 'FELT-100', 'an epic link counts as a parent');
+    stubJira({}, () => ({ status: 204 }));
+    assertEqual(await getExistingParentKey('FELT-5179'), null, 'no parent -> null');
+
+    // already under a different parent: nothing is written, no error is recorded
+    errorCollector.clear?.();
+    const before = errorCollector.errors.length;
+    stubJira({ parent: { key: 'FELT-4799' } }, () => ({ status: 204 }));
+    await updateChildIssues('FELT-5225', gh, false);
+    assertEqual(puts.length, 0, 'a child that already has another parent is not re-parented');
+    assertEqual(errorCollector.errors.length, before, 'and that is not an error');
+
+    // no parent yet and Jira refuses on hierarchy: a warning, not an error
+    stubJira({}, () => { throw hierarchy400; });
+    await updateChildIssues('FELT-5225', gh, false);
+    assertEqual(puts.length >= 1, true, 'the link is attempted when there is no existing parent');
+    assertEqual(errorCollector.errors.length, before, 'a hierarchy refusal is not recorded as an error');
+
+    // no parent and Jira accepts: it is linked as before
+    stubJira({}, () => ({ status: 204 }));
+    await updateChildIssues('FELT-5225', gh, false);
+    assertEqual(puts.length, 1, 'a child with no parent is linked');
+    assertEqual(puts[0].data.fields.parent?.key, 'FELT-5225', 'under the GitHub parent');
+  } finally {
+    jiraClient.get = realGet;
+    jiraClient.put = realPut;
+  }
 }
 
 // ─── Summary ────────────────────────────────────────────────────────────────
