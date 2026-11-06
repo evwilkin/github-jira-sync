@@ -1,6 +1,24 @@
-import { getRepoPRsSince, getIssuePRLinks, editJiraIssue, buildPrUrlsADF, delay } from './helpers.js';
+import { getRepoPRsSince, getIssuePRLinks, editJiraIssue, buildPrUrlsADF, delay, shortDelay, jiraClient, extractTextFromADF } from './helpers.js';
 import { findJiraIssue } from './findJiraIssue.js';
 import { errorCollector, syncStats } from './logging.js';
+
+// The Git Pull Request field's current text (URLs joined by newlines), or null if it can't be read.
+export async function getCurrentPrField(jiraIssueKey) {
+  try {
+    await shortDelay();
+    const { data } = await jiraClient.get(`/rest/api/3/issue/${jiraIssueKey}`, {
+      params: { fields: 'customfield_10875' },
+    });
+    return extractTextFromADF(data.fields?.customfield_10875).trim();
+  } catch {
+    return null;
+  }
+}
+
+// True when the Jira field should be written. An unreadable field (null) is written, as before.
+export function shouldWritePrLinks(currentText, prUrls) {
+  return currentText === null || currentText !== prUrls.join('\n');
+}
 
 function parseIssueUrl(url) {
   const match = url.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/);
@@ -27,6 +45,10 @@ export async function syncPRLinksToJira(owner, repo, since) {
 
       const jiraIssue = await findJiraIssue(issueUrl);
       if (!jiraIssue) continue;
+
+      // Skip the write when Jira already has these links: every write bumps Jira's updated time
+      const current = await getCurrentPrField(jiraIssue.key);
+      if (!shouldWritePrLinks(current, prUrls)) continue;
 
       await delay();
       await editJiraIssue(jiraIssue.key, {
