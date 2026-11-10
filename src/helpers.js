@@ -165,15 +165,34 @@ export function buildSafeDescriptionADF(originalDescription) {
   return { type: 'doc', version: 1, content };
 }
 
+// Jira issues this run has created, keyed by GitHub issue URL. Jira's JQL search index lags a fresh
+// create by ~30-60s, so a lookup by "Upstream URL" can miss an issue made moments ago (a backfill
+// creates sub-issues first, then their parent looks them up). findJiraIssue consults this map and
+// fetches the issue by key, which has no index lag, so the sync never creates a duplicate.
+const createdJiraIssues = new Map();
+
+export function recordCreatedJiraIssue(githubUrl, jiraKey) {
+  if (githubUrl && jiraKey) createdJiraIssues.set(githubUrl, jiraKey);
+}
+
+export function getCreatedJiraKey(githubUrl) {
+  return createdJiraIssues.get(githubUrl) ?? null;
+}
+
+export function clearCreatedJiraIssues() {
+  createdJiraIssues.clear();
+}
+
 export async function createNewJiraIssue(jiraIssueData, githubIssue) {
   await delay();
   const post = (data) =>
     jiraClient
       .post('/rest/api/3/issue', data)
-      .then(
-        async (response) =>
-          await addRemoteLinkToJiraIssue(response.data.key, githubIssue)
-      );
+      .then(async (response) => {
+        // Record before the remote link call: the issue exists even if the link request fails.
+        recordCreatedJiraIssue(githubIssue.url, response.data.key);
+        return await addRemoteLinkToJiraIssue(response.data.key, githubIssue);
+      });
   try {
     return await post(jiraIssueData);
   } catch (error) {

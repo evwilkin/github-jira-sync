@@ -16,6 +16,56 @@ on:
         required: false
         default: ''
         type: string
+      repo:
+        description: 'Repository to sync. Choose "all" to sync every configured repo'
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - AI-infra-ui-components
+          - chatbot
+          - design-tokens
+          - icons
+          - mission-control-dashboard
+          - patternfly
+          - patternfly-a11y
+          - ai-helpers
+          - patternfly-cli
+          - patternfly-design
+          - patternfly-design-kit
+          - patternfly-doc-core
+          - patternfly-elements
+          - patternfly-extension-seed
+          - patternfly-infra-issues
+          - patternfly-mcp
+          - patternfly-org
+          - patternfly-quickstarts
+          - patternfly-react
+          - patternfly-react-seed
+          - pf-codemods
+          - pf-roadmap
+          - react-catalog-view
+          - react-component-groups
+          - react-console
+          - react-data-view
+          - react-log-viewer
+          - react-topology
+          - react-user-feedback
+          - react-virtualized-extension
+          - .github
+          - github-jira-sync
+          - jira-weekly-report
+          - patternfly-analytics
+          - red-hat-design-system
+          - red-hat-design-tokens
+          - red-hat-icons
+
+# One sync at a time. A long manual run (e.g. a backfill of one repo) must not overlap a scheduled
+# run, which could create the same Jira issues twice. A later run waits for the earlier one to finish.
+concurrency:
+  group: github-jira-sync
+  cancel-in-progress: false
 
 jobs:
   sync-github-jira:
@@ -49,11 +99,19 @@ jobs:
           # Jira Cloud Basic auth (email + API token)
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          # Manual-run inputs (empty on scheduled runs). Passed through env, not interpolated into the script.
+          SINCE_DATE: ${{ github.event.inputs.since_date }}
+          SYNC_REPO: ${{ github.event.inputs.repo }}
         run: |
-          if [[ "${{ github.event.inputs.since_date }}" != "" ]]; then
-            echo "Running sync with custom date: ${{ github.event.inputs.since_date }}"
-            node src/index.js --since "${{ github.event.inputs.since_date }}"
+          args=()
+          if [[ -n "$SINCE_DATE" ]]; then
+            echo "Running sync with custom date: $SINCE_DATE"
+            args+=(--since "$SINCE_DATE")
           else
             echo "Running sync with default date (2 days ago)"
-            node src/index.js
           fi
+          if [[ -n "$SYNC_REPO" && "$SYNC_REPO" != "all" ]]; then
+            echo "Running sync for repo: $SYNC_REPO"
+            args+=(--repo "$SYNC_REPO")
+          fi
+          node src/index.js "${args[@]}"

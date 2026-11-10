@@ -13,10 +13,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Import exported functions directly
 import { parseGitHubUrl, buildBatchedIssueStateQuery } from '../src/syncJiraToGitHub.js';
-import { extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, syncCommentsToJira, stripRepoPrefix, jiraClient } from '../src/helpers.js';
+import { availableComponents, recordCreatedJiraIssue, getCreatedJiraKey, clearCreatedJiraIssues, createNewJiraIssue, extractTextFromADF, extractUpstreamUrl, buildJiraIssueData, paginatedJiraSearch, buildPrUrlsADF, getOctokitForOwner, extractJiraKeyFromText, isInvalidInputError, buildSafeDescriptionADF, UNSYNCABLE_DESCRIPTION_MARKER, shouldSyncFromGitHub, normalizeMarkdownForCompare, buildDescriptionADF, adfToMarkdown, editJiraIssue, syncCommentsToJira, stripRepoPrefix, jiraClient } from '../src/helpers.js';
 import { syncStats, errorCollector, markRunFailedIfErrors, emitCiAnnotations, buildStepSummaryMarkdown, writeStepSummary, escapeWorkflowData } from '../src/logging.js';
 import { updateChildIssues, isHierarchyError, getExistingParentKey } from '../src/updateJiraIssue.js';
 import { shouldWritePrLinks, getCurrentPrField } from '../src/syncPRLinksToJira.js';
+import { parseArgs, selectComponents } from '../src/index.js';
+import { findJiraIssue } from '../src/findJiraIssue.js';
 
 let passed = 0;
 let failed = 0;
@@ -1445,6 +1447,154 @@ console.log('\n=== CI annotations and job summary ===');
   const indexSrc = readFileSync(join(__dirname, '../src/index.js'), 'utf-8');
   assert(/printSummary\(\);\s*emitCiAnnotations\(\);\s*writeStepSummary\(\);/.test(indexSrc), 'index.js reports after the summary and before the exit code');
   assert(/import \{[^}]*\bemitCiAnnotations\b[^}]*\bwriteStepSummary\b[^}]*\} from '\.\/logging\.js'/.test(indexSrc) || /import \{[^}]*\bwriteStepSummary\b[^}]*\bemitCiAnnotations\b[^}]*\} from '\.\/logging\.js'/.test(indexSrc), 'index.js imports the functions it calls');
+}
+
+// ─── --repo selection (run one repo from the CLI or the Action) ─────────────
+
+console.log('\n=== --repo argument and repo selection ===');
+
+{
+  assertEqual(parseArgs(['--repo', 'patternfly-elements']).repo, 'patternfly-elements', '--repo takes a bare repo name');
+  assertEqual(parseArgs(['--repo', 'patternfly/patternfly-elements']).repo, 'patternfly/patternfly-elements', '--repo takes owner/name');
+  assertEqual(parseArgs([]).repo, undefined, 'no --repo means all repos');
+  assertEqual(parseArgs(['--repo', 'all']).repo, undefined, '--repo all (the Action dropdown default) means all repos');
+  assertEqual(parseArgs(['--repo', '']).repo, undefined, 'an empty --repo means all repos');
+  assertEqual(parseArgs(['--repo', '  ']).repo, undefined, 'a blank --repo means all repos');
+
+  const combined = parseArgs(['--repo', 'chatbot', '--since', '2026-01-01T00:00:00Z', '--direction', 'github-to-jira']);
+  assertEqual(combined.repo, 'chatbot', '--repo combines with other flags (repo)');
+  assertEqual(combined.since, '2026-01-01T00:00:00Z', '--repo combines with other flags (since)');
+  assertEqual(combined.direction, 'github-to-jira', '--repo combines with other flags (direction)');
+
+  const reordered = parseArgs(['--since', '2026-01-01T00:00:00Z', '--repo', 'chatbot']);
+  assertEqual(reordered.repo, 'chatbot', '--repo is read when it follows --since');
+  assertEqual(reordered.direction, 'both', 'direction still defaults to both');
+
+  const all = selectComponents(undefined);
+  assertEqual(all.components.length, availableComponents.length, 'no repo selects every configured repo');
+  assertEqual(all.error, undefined, 'and is not an error');
+
+  const byName = selectComponents('patternfly-elements');
+  assertEqual(byName.components.length, 1, 'a bare name selects one repo');
+  assertEqual(`${byName.components[0].owner}/${byName.components[0].name}`, 'patternfly/patternfly-elements', 'and it is the right one');
+
+  const byFullName = selectComponents('patternfly/patternfly-elements');
+  assertEqual(byFullName.components.length, 1, 'owner/name selects one repo');
+
+  assertEqual(selectComponents('PatternFly-Elements').components?.length, 1, 'matching ignores case');
+  assertEqual(selectComponents('.github').components?.[0].name, '.github', 'the .github repo can be selected');
+  assertEqual(selectComponents('red-hat-design-system').components?.[0].owner, 'RedHat-UX', 'a RedHat-UX repo keeps its owner (so it uses its own token)');
+
+  const unknown = selectComponents('patternfly-elemnts');
+  assertEqual(unknown.components, undefined, 'a misspelled repo selects nothing');
+  assert(unknown.error?.includes('Unknown repo "patternfly-elemnts"') && unknown.error.includes('patternfly/patternfly-elements'), 'and the error names the typo and lists valid repos');
+  assert(selectComponents('rh-uxd/patternfly-elements').error, 'a real name under the wrong owner is an error, not a silent match');
+
+  const dupes = [{ owner: 'a', name: 'x' }, { owner: 'b', name: 'x' }];
+  assert(selectComponents('x', dupes).error?.includes('ambiguous'), 'a bare name shared by two owners is ambiguous');
+  assertEqual(selectComponents('b/x', dupes).components?.[0].owner, 'b', 'owner/name resolves the ambiguity');
+
+  // An unknown repo must stop the run before any sync starts
+  const indexSrc = readFileSync(join(__dirname, '../src/index.js'), 'utf-8');
+  assert(/selectComponents\(options\.repo\)/.test(indexSrc) && /process\.exitCode = 1/.test(indexSrc), 'index.js selects repos from --repo and sets a failing exit code on an unknown one');
+  assert(/for \(const \{name, owner\} of components\)/.test(indexSrc), 'index.js loops over the selected repos, not all of availableComponents');
+}
+
+// ─── GitHub Action: repo dropdown ────────────────────────────────────────────
+
+console.log('\n=== daily_run.yml repo input ===');
+
+{
+  const yml = readFileSync(join(__dirname, '../.github/workflows/daily_run.yml'), 'utf-8');
+  const optionsBlock = yml.match(/^ {8}options:\n((?: {10}- .+\n)+)/m);
+  const options = optionsBlock ? optionsBlock[1].trim().split('\n').map((l) => l.replace(/^\s*- /, '').trim()) : [];
+  // If this fails, a repo was added to (or removed from) availableComponents: update the dropdown to match
+  assertEqual(JSON.stringify(options), JSON.stringify(['all', ...availableComponents.map((c) => c.name)]), 'the Action repo dropdown is "all" plus every configured repo, in order');
+  assert(/repo:\n(?: {8}.+\n)*? {8}type: choice/.test(yml), 'the repo input is a choice (dropdown)');
+  assert(/^ {8}default: all$/m.test(yml), 'the dropdown defaults to all');
+
+  const runBlock = yml.slice(yml.indexOf('run: |'));
+  assert(!runBlock.includes('${{'), 'inputs reach the script through env, never interpolated into the shell');
+  assert(/SYNC_REPO: \$\{\{ github\.event\.inputs\.repo \}\}/.test(yml) && /SINCE_DATE: \$\{\{ github\.event\.inputs\.since_date \}\}/.test(yml), 'both inputs are passed via env');
+  assert(/"\$SYNC_REPO" != "all"/.test(runBlock) && /--repo "\$SYNC_REPO"/.test(runBlock), 'the script passes --repo only when a repo was chosen');
+  assert(/node src\/index\.js "\$\{args\[@\]\}"/.test(runBlock), 'scheduled runs (no inputs) call index.js with no extra args');
+  assert(/^concurrency:\n {2}group: github-jira-sync\n {2}cancel-in-progress: false$/m.test(yml), 'runs are serialized so a long manual run never overlaps a scheduled one');
+}
+
+// ─── Created-issue registry (Jira search-index lag) ─────────────────────────
+
+console.log('\n=== created-issue registry ===');
+
+{
+  const realGet = jiraClient.get;
+  const realPost = jiraClient.post;
+  const URL1 = 'https://github.com/patternfly/patternfly-elements/issues/2986';
+  const URL2 = 'https://github.com/patternfly/patternfly-elements/issues/2987';
+  const gh = { id: 'I_1', url: URL1, title: 'child' };
+  try {
+    // registry basics
+    clearCreatedJiraIssues();
+    assertEqual(getCreatedJiraKey(URL1), null, 'an unknown URL has no registered key');
+    recordCreatedJiraIssue(URL1, 'FELT-9');
+    assertEqual(getCreatedJiraKey(URL1), 'FELT-9', 'a recorded URL returns its key');
+    recordCreatedJiraIssue(undefined, 'FELT-1');
+    recordCreatedJiraIssue(URL2, undefined);
+    assertEqual(getCreatedJiraKey(URL2), null, 'a missing key is not recorded');
+    clearCreatedJiraIssues();
+    assertEqual(getCreatedJiraKey(URL1), null, 'clearing empties the registry');
+
+    // creating an issue registers it
+    const posts = [];
+    jiraClient.post = async (u, data) => { posts.push(u); return { data: { key: 'FELT-9' } }; };
+    const returned = await createNewJiraIssue({ fields: { summary: 's' } }, gh);
+    assertEqual(returned, 'FELT-9', 'createNewJiraIssue still returns the new key');
+    assertEqual(getCreatedJiraKey(URL1), 'FELT-9', 'createNewJiraIssue registers the new issue by GitHub URL');
+
+    // a failed create registers nothing
+    clearCreatedJiraIssues();
+    jiraClient.post = async () => { throw new Error('boom'); };
+    let threw = false;
+    try { await createNewJiraIssue({ fields: { summary: 's' } }, gh); } catch { threw = true; }
+    assert(threw, 'a failed create still throws');
+    assertEqual(getCreatedJiraKey(URL1), null, 'and registers nothing');
+
+    // index lag: JQL finds nothing, but the issue was created this run -> found by key, no search
+    clearCreatedJiraIssues();
+    recordCreatedJiraIssue(URL1, 'FELT-9');
+    const calls = [];
+    const issue = { key: 'FELT-9', fields: { description: null } };
+    jiraClient.get = async (u, config) => {
+      calls.push(u);
+      if (u === '/rest/api/3/issue/FELT-9') return { data: issue };
+      if (u === '/rest/api/3/search/jql') return { data: { issues: [] } };
+      throw new Error(`unexpected GET ${u}`);
+    };
+    const found = await findJiraIssue(URL1);
+    assertEqual(found?.key, 'FELT-9', 'a just-created issue is found even though the search index has not caught up');
+    assert(!calls.includes('/rest/api/3/search/jql'), 'without needing the JQL search');
+
+    // not in the registry -> JQL search as before (no duplicate-protecting shortcut for unknown issues)
+    calls.length = 0;
+    const missing = await findJiraIssue(URL2);
+    assertEqual(missing, null, 'an unregistered issue the search cannot find is still "not found"');
+    assertEqual(calls.filter((u) => u === '/rest/api/3/search/jql').length, 1, 'and is looked up with the search');
+    assert(!calls.some((u) => u.startsWith('/rest/api/3/issue/')), 'with no by-key fetch');
+
+    // registered but the by-key GET fails -> fall back to the search instead of failing the lookup
+    calls.length = 0;
+    const desc = { type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: `Upstream URL: ${URL1}` }] }] };
+    jiraClient.get = async (u) => {
+      calls.push(u);
+      if (u === '/rest/api/3/issue/FELT-9') throw new Error('500');
+      return { data: { issues: [{ key: 'FELT-9', fields: { description: desc } }] } };
+    };
+    const fallback = await findJiraIssue(URL1);
+    assertEqual(fallback?.key, 'FELT-9', 'a failed by-key fetch falls back to the search');
+  } finally {
+    jiraClient.get = realGet;
+    jiraClient.post = realPost;
+    clearCreatedJiraIssues();
+  }
 }
 
 // ─── Summary ────────────────────────────────────────────────────────────────
