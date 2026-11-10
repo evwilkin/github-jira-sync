@@ -25,8 +25,7 @@ const isValidISOString = (str) => {
 };
 
 // Parse command line arguments
-function parseArgs() {
-  const args = process.argv.slice(2);
+export function parseArgs(args = process.argv.slice(2)) {
   const options = {};
   
   for (let i = 0; i < args.length; i++) {
@@ -75,6 +74,15 @@ function parseArgs() {
       
       // Skip the next argument since we consumed it
       i++;
+    } else if (args[i] === '--repo' && i + 1 < args.length) {
+      // "name" or "owner/name"; an empty value means all repos
+      const repoValue = args[i + 1].trim();
+      if (repoValue && repoValue !== 'all') {
+        options.repo = repoValue;
+      }
+
+      // Skip the next argument since we consumed it
+      i++;
     }
   }
   
@@ -84,6 +92,27 @@ function parseArgs() {
   }
   
   return options;
+}
+
+// Narrow the configured repos to the one named by --repo ("name" or "owner/name").
+// No repo means all of them. Returns { components } or { error } for an unknown repo.
+export function selectComponents(repoArg, components = availableComponents) {
+  if (!repoArg) {
+    return { components };
+  }
+  const wanted = repoArg.toLowerCase();
+  const matches = components.filter(
+    ({ name, owner }) => name.toLowerCase() === wanted || `${owner}/${name}`.toLowerCase() === wanted
+  );
+  if (matches.length === 0) {
+    const valid = components.map(({ owner, name }) => `${owner}/${name}`).join(', ');
+    return { error: `Unknown repo "${repoArg}". Valid repos: ${valid}` };
+  }
+  if (matches.length > 1) {
+    const options = matches.map(({ owner, name }) => `${owner}/${name}`).join(', ');
+    return { error: `Repo "${repoArg}" is ambiguous (${options}). Use owner/name.` };
+  }
+  return { components: matches };
 }
 
 const fetchJiraIssues = async (owner, repo, since) => {
@@ -280,21 +309,29 @@ if (entryHref && import.meta.url === entryHref) {
   })();
   const direction = options.direction || 'both';
 
-  console.log(`Syncing issues since: ${since}`);
-  console.log(`Sync direction: ${direction}`);
+  const { components, error: repoError } = selectComponents(options.repo);
+  if (repoError) {
+    // Fail before touching Jira or GitHub, so a typo never silently syncs nothing (or everything)
+    console.error(`** ERROR: ${repoError}`);
+    process.exitCode = 1;
+  } else {
+    console.log(`Syncing issues since: ${since}`);
+    console.log(`Sync direction: ${direction}`);
+    console.log(`Repos: ${options.repo ? components.map(({ owner, name }) => `${owner}/${name}`).join(', ') : `all (${components.length})`}`);
 
-  // If syncing all, loop through availableComponents
-  for (const {name, owner} of availableComponents) {
-    await syncIssues(owner, name, since, direction);
-  }
+    // Loop through the selected repos (all of availableComponents unless --repo is given)
+    for (const {name, owner} of components) {
+      await syncIssues(owner, name, since, direction);
+    }
 
-  syncStats.printSummary();
-  emitCiAnnotations();
-  writeStepSummary();
+    syncStats.printSummary();
+    emitCiAnnotations();
+    writeStepSummary();
 
-  // Individual sync operations collect and log errors so the remaining repos
-  // can still be processed. Mark the overall run failed only after the summary.
-  if (markRunFailedIfErrors()) {
-    console.log('\nSync completed with errors; marking this run as failed.');
+    // Individual sync operations collect and log errors so the remaining repos
+    // can still be processed. Mark the overall run failed only after the summary.
+    if (markRunFailedIfErrors()) {
+      console.log('\nSync completed with errors; marking this run as failed.');
+    }
   }
 }

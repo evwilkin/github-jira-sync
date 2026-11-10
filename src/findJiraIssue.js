@@ -1,4 +1,4 @@
-import { jiraClient, shortDelay, extractTextFromADF } from './helpers.js';
+import { jiraClient, shortDelay, extractTextFromADF, getCreatedJiraKey } from './helpers.js';
 import { jiraIssues } from './index.js';
 import { errorCollector } from './logging.js';
 
@@ -27,9 +27,35 @@ export async function findJiraIssue(githubIssueLink) {
     return jiraIssue;
   }
 
+  // An issue created earlier in this run may not be in Jira's search index yet; fetch it by key
+  const createdKey = getCreatedJiraKey(githubIssueLink);
+  if (createdKey) {
+    const createdIssue = await fetchJiraIssueByKey(createdKey);
+    if (createdIssue) {
+      return createdIssue;
+    }
+  }
+
   // If not, fetch the issue from Jira
   return await fetchJiraIssue(githubIssueLink);
 }
+
+const FIND_FIELDS = 'key,id,description,status,assignee,issuetype,updated,summary';
+
+// Direct GET by key: reflects a fresh create immediately, unlike the JQL search.
+const fetchJiraIssueByKey = async (jiraKey) => {
+  try {
+    await shortDelay();
+    const response = await jiraClient.get(`/rest/api/3/issue/${jiraKey}`, {
+      params: { fields: FIND_FIELDS },
+    });
+    return response.data;
+  } catch (error) {
+    // Fall back to the search rather than failing the lookup
+    console.log(` - Could not fetch just-created Jira issue ${jiraKey} by key; falling back to search`);
+    return null;
+  }
+};
 
 const fetchJiraIssue = async (githubIssueLink) => {
   // Note: Jira API requires escaped quotes in JQL query for exact match
@@ -40,7 +66,7 @@ const fetchJiraIssue = async (githubIssueLink) => {
     const response = await jiraClient.get('/rest/api/3/search/jql', {
       params: {
         jql,
-        fields: 'key,id,description,status,assignee,issuetype,updated,summary',
+        fields: FIND_FIELDS,
       },
     });
     // Check against regex to filter out any substring matches
